@@ -1,6 +1,0 @@
-/root/mmt_project/mmt-do-an-1-websocket-controller/build/CMakeFiles/edit_cache.dir
-/root/mmt_project/mmt-do-an-1-websocket-controller/build/CMakeFiles/rebuild_cache.dir
-/root/mmt_project/mmt-do-an-1-websocket-controller/build/src/CMakeFiles/server.dir
-/root/mmt_project/mmt-do-an-1-websocket-controller/build/src/CMakeFiles/client.dir
-/root/mmt_project/mmt-do-an-1-websocket-controller/build/src/CMakeFiles/edit_cache.dir
-/root/mmt_project/mmt-do-an-1-websocket-controller/build/src/CMakeFiles/rebuild_cache.dir
