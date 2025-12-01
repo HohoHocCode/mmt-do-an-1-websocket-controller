@@ -1,0 +1,16 @@
+# ninja log v7
+52	875	7862956815300130	CMakeFiles/modules.dir/src/modules/consent.cpp.obj	4a6056d1711352f1
+47	888	7862956815249576	CMakeFiles/modules.dir/src/modules/system_control.cpp.obj	2d4c7dd0f2ae99e7
+56	948	7862956815345487	CMakeFiles/modules.dir/src/utils/base64.cpp.obj	4ebd0f88a7c0ee4b
+79	2451	7862956815571878	CMakeFiles/server.dir/src/server/main.cpp.obj	2dffe1ed9f0fd7fd
+43	4398	7862956815212038	CMakeFiles/modules.dir/src/modules/camera.cpp.obj	a5fa268be9307c5f
+39	5538	7862956815173570	CMakeFiles/modules.dir/src/modules/screen.cpp.obj	d3b76f5f530f164d
+36	5873	7862956815131109	CMakeFiles/modules.dir/src/modules/process.cpp.obj	dffddd8cd86e3948
+30	7856	7862956815079758	CMakeFiles/modules.dir/src/core/dispatcher.cpp.obj	2fc11bb8a7c7bc09
+7857	8145	7862956893343522	libmodules.a	9fb28c27a4116cc2
+85	10618	7862956815644207	CMakeFiles/client.dir/src/client/main.cpp.obj	1293e578d7b9ed0e
+70	16888	7862956815481261	CMakeFiles/network.dir/src/network/ws_client.cpp.obj	96d22331fe1250d0
+61	20161	7862956815381950	CMakeFiles/network.dir/src/network/ws_server.cpp.obj	53b9b2ac5b2e909a
+20162	20685	7862957016392582	libnetwork.a	30b3607e83a7515d
+20699	23524	7862957021774148	client.exe	3b6a6c15e7d4f469
+20685	23677	7862957021633809	server.exe	74a19b90405610f0
