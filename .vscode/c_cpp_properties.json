@@ -1,0 +1,22 @@
+{
+    "configurations": [
+        {
+            "name": "Win32",
+            "includePath": [
+                "${workspaceFolder}/include",
+                "${workspaceFolder}/src",
+                "${workspaceFolder}/**",
+
+                // OpenCV include path (MSYS2 MinGW64)
+                "D:/msys64/mingw64/include/opencv4",
+                "D:/msys64/mingw64/include"
+            ],
+            "defines": [],
+            "cStandard": "c17",
+            "cppStandard": "c++20",
+            "intelliSenseMode": "windows-gcc-x64",
+            "compilerPath": "D:/msys64/mingw64/bin/g++.exe"
+        }
+    ],
+    "version": 4
+}

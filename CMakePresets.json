@@ -1,0 +1,16 @@
+{
+    "version": 3,
+    "configurePresets": [
+      {
+        "name": "mingw64",
+        "generator": "Ninja",
+        "binaryDir": "build",
+        "cacheVariables": {
+          "CMAKE_MAKE_PROGRAM": "/mingw64/bin/ninja",
+          "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/vcpkg/scripts/buildsystems/vcpkg.cmake",
+          "VCPKG_TARGET_TRIPLET": "x64-mingw-static"
+        }
+      }
+    ]
+  }
+  
