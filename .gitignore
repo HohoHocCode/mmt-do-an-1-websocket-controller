@@ -1,0 +1,28 @@
+# Build
+build/
+*.o
+*.obj
+*.exe
+*.out
+
+# Dependencies
+node_modules/
+client/web/dist/
+
+# Logs
+data/logs/*.log
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Data
+data/database/
+data/sessions/
+EOF
