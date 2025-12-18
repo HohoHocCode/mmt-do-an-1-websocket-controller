@@ -4,15 +4,78 @@ project(mmt_ws_controller LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+set(HAVE_DEPS ON)
+
 # ---------------------------------------------------------
 # Boost
 # ---------------------------------------------------------
-find_package(Boost CONFIG REQUIRED COMPONENTS system)
+find_package(Boost CONFIG COMPONENTS system)
+if (NOT Boost_FOUND)
+    find_package(Boost COMPONENTS system)
+endif()
+if (NOT Boost_FOUND)
+    set(HAVE_DEPS OFF)
+endif()
 
 # ---------------------------------------------------------
 # OpenCV (from MSYS2 MinGW64)
 # ---------------------------------------------------------
-find_package(OpenCV CONFIG REQUIRED)
+find_package(OpenCV CONFIG)
+if (NOT OpenCV_FOUND)
+    find_package(OpenCV)
+endif()
+if (NOT OpenCV_FOUND)
+    set(HAVE_DEPS OFF)
+endif()
+
+if (NOT HAVE_DEPS)
+    message(WARNING "Boost/OpenCV not found; building stub targets for limited functionality.")
+
+    add_library(core INTERFACE)
+    target_include_directories(core INTERFACE 
+        ${CMAKE_SOURCE_DIR}/include
+    )
+
+    add_library(modules
+        src/stub/modules_stub.cpp
+    )
+
+    target_link_libraries(modules PUBLIC
+        core
+    )
+
+    add_library(network
+        src/stub/network_stub.cpp
+    )
+
+    target_link_libraries(network PUBLIC
+        core
+    )
+
+    add_executable(server 
+        src/stub/server_stub.cpp
+    )
+
+    target_link_libraries(server 
+        PRIVATE 
+            core
+            network
+            modules
+    )
+
+    add_executable(client 
+        src/stub/client_stub.cpp
+    )
+
+    target_link_libraries(client 
+        PRIVATE 
+            core 
+            network
+            modules   
+    )
+
+    return()
+endif()
 
 message(STATUS "OpenCV version: ${OpenCV_VERSION}")
 message(STATUS "OpenCV include: ${OpenCV_INCLUDE_DIRS}")
@@ -74,9 +137,10 @@ target_link_libraries(network
         core
         Boost::boost
         Boost::system
-        ws2_32
-        mswsock
 )
+if (WIN32)
+    target_link_libraries(network PUBLIC ws2_32 mswsock)
+endif()
 
 # ---------------------------------------------------------
 # server executable
@@ -90,9 +154,10 @@ target_link_libraries(server
         core
         network
         modules      # <<== ProcessManager + Dispatcher
-        ws2_32
-        mswsock
 )
+if (WIN32)
+    target_link_libraries(server PRIVATE ws2_32 mswsock)
+endif()
 
 # ---------------------------------------------------------
 # client executable
@@ -106,6 +171,7 @@ target_link_libraries(client
         core 
         network
         modules   
-        ws2_32
-        mswsock
 )
+if (WIN32)
+    target_link_libraries(client PRIVATE ws2_32 mswsock)
+endif()

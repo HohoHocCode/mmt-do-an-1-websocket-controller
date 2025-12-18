@@ -88,6 +88,10 @@ interface RemoteTarget {
 
 const DEFAULT_PORT = 9002;
 const createId = () => `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+const appendLog = (target: RemoteTarget, log: Log): RemoteTarget => ({
+  ...target,
+  logs: [...target.logs, log].slice(-LOG_LIMIT),
+});
 
 function formatTime(date: Date) {
   return date.toLocaleTimeString();
@@ -226,11 +230,7 @@ export default function App() {
     setTargets((prev) =>
       prev.map((t) =>
         t.id === id
-          ? {
-              ...t,
-              // [PATCH] giới hạn log
-              logs: [...t.logs, { text, type, timestamp: new Date() }].slice(-LOG_LIMIT),
-            }
+          ? appendLog(t, { text, type, timestamp: new Date() })
           : t
       )
     );
@@ -468,26 +468,25 @@ export default function App() {
       prev.map((t) => {
         if (t.id !== id) return t;
         if (!t.ws || t.ws.readyState !== WebSocket.OPEN) {
-          return {
-            ...t,
-            logs: [...t.logs, { text: "Cannot send: not connected", type: "error", timestamp: new Date() }].slice(-LOG_LIMIT),
-          };
+          const log: Log = { text: "Cannot send: not connected", type: "error", timestamp: new Date() };
+          return appendLog(t, log);
         }
         const raw = JSON.stringify(payload);
 
         // [PATCH] send an toàn
         const ok = safeSend(t.ws, raw);
         if (!ok) {
-          return {
-            ...t,
-            logs: [...t.logs, { text: "Send failed (socket not open)", type: "error", timestamp: new Date() }].slice(-LOG_LIMIT),
-          };
+          const log: Log = { text: "Send failed (socket not open)", type: "error", timestamp: new Date() };
+          return appendLog(t, log);
         }
 
-        return {
-          ...t,
-          logs: [...t.logs, { text: label ? `$ ${label}  ${raw}` : `$ ${raw}`, type: "command", timestamp: new Date() }].slice(-LOG_LIMIT),
+        const commandLog: Log = {
+          text: label ? `$ ${label}  ${raw}` : `$ ${raw}`,
+          type: "command",
+          timestamp: new Date(),
         };
+
+        return appendLog(t, commandLog);
       })
     );
   };
