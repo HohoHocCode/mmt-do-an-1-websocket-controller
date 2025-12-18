@@ -1,0 +1,40 @@
+####################################
+# Visual Studio / Visual Studio Code
+####################################
+.vs/
+.vscode/
+
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+####################################
+# Build folders / binaries
+####################################
+Debug/
+Release/
+x64/
+x86/
+build/
+
+*.exe
+*.dll
+*.lib
+*.obj
+*.pdb
+*.ilk
+
+####################################
+# CMake
+####################################
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+####################################
+# OS junk
+####################################
+Thumbs.db
+.DS_Store

@@ -1,0 +1,6 @@
+C:/Users/trinh/mmt-do-an-1-websocket-controller/build/CMakeFiles/modules.dir
+C:/Users/trinh/mmt-do-an-1-websocket-controller/build/CMakeFiles/network.dir
+C:/Users/trinh/mmt-do-an-1-websocket-controller/build/CMakeFiles/server.dir
+C:/Users/trinh/mmt-do-an-1-websocket-controller/build/CMakeFiles/client.dir
+C:/Users/trinh/mmt-do-an-1-websocket-controller/build/CMakeFiles/ALL_BUILD.dir
+C:/Users/trinh/mmt-do-an-1-websocket-controller/build/CMakeFiles/ZERO_CHECK.dir
