@@ -359,7 +359,7 @@ export default function LoginPage({
 
             <div className="mt-8 flex items-center justify-between text-[11px] text-slate-500">
               <span>Session Entry</span>
-              <span>© Remote Desktop Control</span>
+              <span>© {appName}</span>
             </div>
           </div>
         </div>
