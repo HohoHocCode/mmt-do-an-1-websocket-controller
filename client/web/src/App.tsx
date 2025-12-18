@@ -21,7 +21,7 @@ import {
 import LoginPage from "./LoginPage";
 
 // [ADDED] App name (để LoginPage / Header dùng thống nhất)
-const APP_NAME = "REMOTE DESKTOP CONTROL"; // [ADDED]
+const APP_NAME = "Remote Control Center"; // [ADDED]
 
 // Commands (JSON over WebSocket):
 //   {"cmd":"ping"}
@@ -152,6 +152,12 @@ function safeSend(ws: WebSocket | undefined, raw: string) {
 
 // [PATCH] giới hạn log để tránh lag/memory leak
 const LOG_LIMIT = 400;
+
+const buildLog = (text: string, type: LogType): Log => ({ text, type, timestamp: new Date() });
+const appendLogEntry = (target: RemoteTarget, log: Log): RemoteTarget => ({
+  ...target,
+  logs: [...target.logs, log].slice(-LOG_LIMIT),
+});
 
 export default function App() {
   const [targets, setTargets] = useState<RemoteTarget[]>([]);
@@ -468,26 +474,20 @@ export default function App() {
       prev.map((t) => {
         if (t.id !== id) return t;
         if (!t.ws || t.ws.readyState !== WebSocket.OPEN) {
-          return {
-            ...t,
-            logs: [...t.logs, { text: "Cannot send: not connected", type: "error", timestamp: new Date() }].slice(-LOG_LIMIT),
-          };
+          return appendLogEntry(t, buildLog("Cannot send: not connected", "error"));
         }
         const raw = JSON.stringify(payload);
 
         // [PATCH] send an toàn
         const ok = safeSend(t.ws, raw);
         if (!ok) {
-          return {
-            ...t,
-            logs: [...t.logs, { text: "Send failed (socket not open)", type: "error", timestamp: new Date() }].slice(-LOG_LIMIT),
-          };
+          return appendLogEntry(t, buildLog("Send failed (socket not open)", "error"));
         }
 
-        return {
-          ...t,
-          logs: [...t.logs, { text: label ? `$ ${label}  ${raw}` : `$ ${raw}`, type: "command", timestamp: new Date() }].slice(-LOG_LIMIT),
-        };
+        return appendLogEntry(
+          t,
+          buildLog(label ? `$ ${label}  ${raw}` : `$ ${raw}`, "command")
+        );
       })
     );
   };
@@ -573,7 +573,7 @@ export default function App() {
         <div className="absolute -bottom-56 -right-48 h-[720px] w-[720px] rounded-full bg-cyan-500/20 blur-3xl" />
       </div>
       <div className="max-w-7xl mx-auto flex flex-col gap-4 h-[calc(100vh-2rem)]">
-        <Header title="Remote Control Center" connectedCount={targets.filter((t) => t.connected).length} />
+        <Header title={APP_NAME} connectedCount={targets.filter((t) => t.connected).length} />
 
         <div className="flex-1 flex flex-col md:flex-row gap-4 min-h-0">
           {/* Sidebar */}
