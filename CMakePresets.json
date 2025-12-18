@@ -10,6 +10,20 @@
           "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/vcpkg/scripts/buildsystems/vcpkg.cmake",
           "VCPKG_TARGET_TRIPLET": "x64-mingw-static"
         }
+      },
+      {
+        "name": "codex-linux",
+        "generator": "Unix Makefiles",
+        "binaryDir": "build/codex-linux",
+        "cacheVariables": {
+          "MMT_CODEX_SANDBOX": true
+        }
+      }
+    ],
+    "buildPresets": [
+      {
+        "name": "codex-linux",
+        "configurePreset": "codex-linux"
       }
     ]
   }
