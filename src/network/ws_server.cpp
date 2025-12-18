@@ -12,6 +12,7 @@
 #include <memory>
 #include <string>
 #include <chrono>
+#include <atomic>
 
 namespace asio  = boost::asio;
 namespace beast = boost::beast;
@@ -49,6 +50,7 @@ public:
 
 private:
     struct SessionState {
+        std::atomic_bool cancel_flag{false};
         bool streaming = false;
         int stream_seq = 0;
         int stream_interval_ms = 0;
@@ -56,7 +58,10 @@ private:
         int requested_duration = 0;
         int requested_fps = 0;
         std::size_t stream_generation = 0;
+        std::size_t task_generation = 0;
         std::string active_request_id;
+        std::string active_task_id;
+        std::string active_task;
     };
 
     ws::stream<tcp::socket> ws_;
@@ -76,6 +81,13 @@ private:
             std::cerr << "[WsServer] Accept error: " << ec.message() << "\n";
             return;
         }
+        auto self = shared_from_this();
+        ws_.control_callback([self](ws::frame_type kind, beast::string_view, beast::error_code const& cb_ec) {
+            if (cb_ec) return;
+            if (kind == ws::frame_type::close) {
+                self->handle_disconnect("peer_closed");
+            }
+        });
         do_read();
     }
 
@@ -92,10 +104,13 @@ private:
 
     // ------------------------------------------------------------------------
     void on_read(beast::error_code ec, std::size_t) {
-        if (ec == ws::error::closed)
+        if (ec == ws::error::closed) {
+            handle_disconnect("closed");
             return;
+        }
         if (ec) {
             std::cerr << "[WsServer] Read error: " << ec.message() << "\n";
+            handle_disconnect("read_error");
             return;
         }
 
@@ -171,16 +186,19 @@ private:
             send_error("invalid_command", "Field 'cmd' is required and must be a string.", req);
             return;
         }
+        if (req.contains("requestId") && !req["requestId"].is_string()) {
+            send_error("invalid_request_id", "'requestId' must be a string when provided.", req);
+            return;
+        }
 
         std::string cmd = req["cmd"];
 
-        if (state_.streaming && cmd != "screen_stream") {
-            cancel_stream("superseded_by_command");
+        if (!state_.active_task.empty() || state_.streaming) {
+            cancel_active_task("superseded_by_command");
         }
 
         if (cmd == "cancel_all" || cmd == "reset") {
-            cancel_stream("reset_command");
-            state_ = SessionState{};
+            cancel_active_task("reset_command");
             Json resp = dispatcher_.handle(req);
             send_json(resp, req);
             return;
@@ -217,6 +235,7 @@ private:
             ack["duration"] = duration;
             ack["fps"] = fps;
             ack["message"] = "Screen stream started.";
+            ack["taskId"] = state_.active_task_id;
 
             send_json(ack, req);
             return;
@@ -227,9 +246,9 @@ private:
     }
 
     void start_screen_stream(int duration, int fps, const Json& req) {
-        cancel_stream("restarting_stream");
-
-        state_.stream_generation++;
+        state_.task_generation++;
+        state_.stream_generation = state_.task_generation;
+        state_.active_task = "screen_stream";
         state_.streaming = true;
         state_.stream_seq = 0;
         state_.requested_duration = duration;
@@ -239,6 +258,10 @@ private:
         state_.active_request_id = req.contains("requestId") && req["requestId"].is_string()
             ? req["requestId"].get<std::string>()
             : std::string{};
+        state_.active_task_id = !state_.active_request_id.empty()
+            ? state_.active_request_id
+            : "task-" + std::to_string(state_.stream_generation);
+        state_.cancel_flag.store(false);
 
         std::cout << "[WsServer] Streaming start: "
                   << fps << " fps, "
@@ -255,12 +278,10 @@ private:
         );
 
         stream_timeout_timer_.expires_after(std::chrono::seconds(kMaxStreamSeconds));
-        stream_timeout_timer_.async_wait(
-            [self = shared_from_this(), token = state_.stream_generation](beast::error_code ec) {
-                if (ec == asio::error::operation_aborted) return;
-                self->cancel_stream("timeout", token);
-            }
-        );
+        stream_timeout_timer_.async_wait([self = shared_from_this()](beast::error_code ec) {
+            if (ec == asio::error::operation_aborted) return;
+            self->cancel_active_task("timeout");
+        });
     }
 
     Json build_stream_status(const std::string& reason) const {
@@ -268,6 +289,9 @@ private:
         status["cmd"] = "screen_stream";
         status["status"] = "stopped";
         status["reason"] = reason;
+        if (!state_.active_task_id.empty()) {
+            status["taskId"] = state_.active_task_id;
+        }
         if (!state_.active_request_id.empty()) {
             status["requestId"] = state_.active_request_id;
         }
@@ -282,6 +306,7 @@ private:
             return;
         }
 
+        state_.cancel_flag.store(true);
         state_.streaming = false;
         stream_timer_.cancel();
         stream_timeout_timer_.cancel();
@@ -289,23 +314,53 @@ private:
         if (notify) {
             send_text(build_stream_status(reason).dump());
         }
+    }
+
+    void cancel_active_task(const std::string& reason, bool notify = true) {
+        if (state_.active_task.empty() && !state_.streaming) {
+            return;
+        }
+
+        if (state_.streaming) {
+            cancel_stream(reason, state_.stream_generation, notify);
+        }
+
+        if (notify) {
+            Json evt;
+            evt["cmd"] = "task_cancelled";
+            evt["status"] = "cancelled";
+            evt["reason"] = reason;
+            evt["task"] = state_.active_task.empty() ? "unknown" : state_.active_task;
+            evt["taskId"] = state_.active_task_id;
+            send_text(evt.dump());
+        }
 
         reset_stream_fields();
+        clear_active_task();
     }
 
     void reset_stream_fields() {
+        state_.streaming = false;
         state_.stream_seq = 0;
         state_.stream_total_frames = 0;
         state_.stream_interval_ms = 0;
         state_.requested_duration = 0;
         state_.requested_fps = 0;
         state_.active_request_id.clear();
+        state_.active_task_id.clear();
+        state_.stream_generation = 0;
+    }
+
+    void clear_active_task() {
+        state_.active_task.clear();
+        state_.cancel_flag.store(false);
     }
 
     // ------------------------------------------------------------------------
     void do_stream_frame(beast::error_code ec, std::size_t token) {
         if (ec == asio::error::operation_aborted) return;
         if (!state_.streaming || token != state_.stream_generation) return;
+        if (state_.cancel_flag.load()) return;
 
         if (state_.stream_seq >= state_.stream_total_frames) {
             std::cout << "[WsServer] Stream finished\n";
@@ -313,13 +368,14 @@ private:
             stream_timeout_timer_.cancel();
             send_text(build_stream_status("completed").dump());
             reset_stream_fields();
+            clear_active_task();
             return;
         }
 
         std::string b64 = ScreenCapture::capture_base64();
         if (b64.empty()) {
             std::cerr << "[WsServer] ScreenCapture failed\n";
-            cancel_stream("capture_failed", token);
+            cancel_active_task("capture_failed");
             return;
         }
 
@@ -327,6 +383,9 @@ private:
         j["cmd"] = "screen_stream";
         j["seq"] = state_.stream_seq;
         j["image_base64"] = b64;
+        if (!state_.active_task_id.empty()) {
+            j["taskId"] = state_.active_task_id;
+        }
         if (!state_.active_request_id.empty()) {
             j["requestId"] = state_.active_request_id;
         }
@@ -340,7 +399,7 @@ private:
                 if (write_ec) {
                     std::cerr << "[WsServer] Stream write error: "
                               << write_ec.message() << "\n";
-                    self->cancel_stream("write_error", token, false);
+                    self->cancel_active_task("write_error", false);
                     return;
                 }
 
@@ -361,6 +420,12 @@ private:
                 );
             }
         );
+    }
+
+    void handle_disconnect(const std::string& reason) {
+        cancel_active_task(reason, false);
+        stream_timer_.cancel();
+        stream_timeout_timer_.cancel();
     }
 };
 
