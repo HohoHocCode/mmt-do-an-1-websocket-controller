@@ -1,16 +1,36 @@
 {
-    "version": 3,
-    "configurePresets": [
-      {
-        "name": "mingw64",
-        "generator": "Ninja",
-        "binaryDir": "build",
-        "cacheVariables": {
-          "CMAKE_MAKE_PROGRAM": "/mingw64/bin/ninja",
-          "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/vcpkg/scripts/buildsystems/vcpkg.cmake",
-          "VCPKG_TARGET_TRIPLET": "x64-mingw-static"
-        }
+  "version": 3,
+  "configurePresets": [
+    {
+      "name": "mingw64",
+      "generator": "Ninja",
+      "binaryDir": "build",
+      "cacheVariables": {
+        "CMAKE_MAKE_PROGRAM": "/mingw64/bin/ninja",
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/vcpkg/scripts/buildsystems/vcpkg.cmake",
+        "VCPKG_TARGET_TRIPLET": "x64-mingw-static"
       }
-    ]
-  }
-  
+    },
+    {
+      "name": "codex-linux",
+      "displayName": "Codex Linux (Ninja + vcpkg)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/codex-linux",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/vcpkg/scripts/buildsystems/vcpkg.cmake",
+        "VCPKG_TARGET_TRIPLET": "x64-linux"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "mingw64",
+      "configurePreset": "mingw64"
+    },
+    {
+      "name": "codex-linux",
+      "configurePreset": "codex-linux"
+    }
+  ]
+}
