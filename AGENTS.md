@@ -1,23 +1,23 @@
-# agent.md — Hướng dẫn cho Codex/Agent làm việc trong repo này
+# AGENTS.md — Guide for Codex/Agents working in this repository
 
-## 0) Mục tiêu tổng quát
-Bạn (Agent) cần thực hiện 3 nhóm việc chính:
+## 0) Overall goals
+As an Agent, you must deliver work across **three** main areas:
 
-1) **Kiểm tra và xử lý bug toàn dự án**
-- Dò lỗi compile/build, runtime, logic, crash, memory leak, race-condition (nếu có).
-- Ưu tiên: lỗi gây crash/không chạy được/không kết nối được WebSocket > lỗi logic > lỗi UX.
+1) **Project-wide bug hunting & fixes**
+- Investigate compile/build issues, runtime errors, logic bugs, crashes, memory leaks, race conditions (if any).
+- Priority order: **crash / cannot run / cannot connect WebSocket** > logic bugs > UX issues.
 
-2) **Cải thiện UI/UX phần web (hiện đại, dễ dùng, rõ trạng thái)**
-- Làm UI trông “modern”, gọn gàng, có hệ thống, responsive.
-- Nâng trải nghiệm: trạng thái kết nối, lỗi/notification, loading, empty-state, layout, typography.
+2) **Improve Web UI/UX (modern, usable, clear state)**
+- Make the UI look **modern**, clean, consistent, and responsive.
+- Improve experience: connection status, errors/notifications, loading states, empty states, layout, typography.
 
-3) **Xử lý “hoàn chỉnh” các file trong danh sách phạm vi dưới đây**
-- Đọc kỹ, refactor hợp lý, sửa lỗi, cải thiện cấu trúc, thêm type/validation, dọn code smell.
-- Nếu cần sửa các file ngoài danh sách để build/test chạy được thì được phép, nhưng **tối thiểu thay đổi**.
+3) **Thoroughly handle the files within the scope list below**
+- Read carefully, refactor reasonably, fix bugs, improve structure, add types/validation, reduce code smells.
+- If you must edit files outside the scope to make build/test pass, you may do so — but keep changes **minimal**.
 
 ---
 
-## 1) Phạm vi file bắt buộc xử lý
+## 1) Required file scope
 ### Root
 - `list.h`, `list.cpp`
 - `start.h`, `start.cpp`
@@ -72,143 +72,158 @@ Bạn (Agent) cần thực hiện 3 nhóm việc chính:
 
 ---
 
-## 2) Ràng buộc an toàn & đạo đức (BẮT BUỘC)
-Repo có file `keylogger.*`. Agent **không được**:
-- Mở rộng tính năng theo hướng thu thập dữ liệu nhạy cảm trái phép, ẩn giấu, tự động gửi dữ liệu, hoặc bất kỳ hành vi xâm phạm quyền riêng tư.
-- Thêm cơ chế stealth/persistence/ẩn tiến trình.
+## 2) Safety & ethics constraints (MANDATORY)
+This repository contains `keylogger.*`. The Agent **MUST NOT**:
+- Expand or create functionality intended for unauthorized sensitive data collection, stealth behavior, persistence, or hidden exfiltration.
+- Add stealth/persistence mechanisms or process-hiding.
 
-Agent **được**:
-- Refactor để code rõ ràng hơn, an toàn hơn.
-- **Vô hiệu hoá theo mặc định** các hành vi nhạy cảm.
-- Bắt buộc **consent rõ ràng** (module `consent.*`) trước khi kích hoạt bất kỳ chức năng nhạy cảm.
-- Thêm giới hạn/rate-limit, kiểm tra input, logging minh bạch, và cơ chế tắt.
+The Agent **MAY**:
+- Refactor for clarity, safety, and maintainability.
+- **Disable sensitive behavior by default**.
+- Require **explicit, informed consent** (via `consent.*`) before enabling any sensitive capability.
+- Add rate limits, input validation, transparent logging, safety toggles, and opt-out mechanisms.
 
-Nếu phát hiện chức năng/luồng nào có rủi ro cao, ưu tiên:
-- Đưa ra đề xuất an toàn hơn (ví dụ “remove/disable feature”, “require explicit opt-in UI + server-side check”).
-
----
-
-## 3) Quy trình làm việc chuẩn (khuyến nghị)
-### Bước A — Khảo sát & lập kế hoạch
-1) Xác định cấu trúc: server/client C++, web client, luồng WebSocket, command dispatcher.
-2) Liệt kê các lỗi tiềm năng:
-   - Build/CMake/vcpkg (nếu có), include path, warning-as-error, mismatch standard.
-   - Network WS: parse message, concurrency, disconnect handling, ping/pong, reconnection.
-   - Module: system/screen/process/camera, quyền truy cập, lỗi OS-specific.
-3) Ghi lại “Top issues” theo mức độ nghiêm trọng và cách tái hiện.
-
-### Bước B — Làm cho dự án chạy được
-- Ưu tiên làm **build chạy ổn** (C++ và web).
-- Bổ sung hướng dẫn chạy trong README hoặc ghi chú ngắn (nếu repo có README) nhưng không bắt buộc.
-
-### Bước C — Fix bug theo vòng lặp nhỏ
-Mỗi bugfix:
-1) Có bước tái hiện rõ (hoặc log/trace).
-2) Fix tối thiểu, không “đập đi xây lại”.
-3) Nếu dự án có test framework: thêm test.
-4) Nếu chưa có test: thêm ít nhất kiểm tra runtime/validation/log giúp phát hiện regressions.
-
-### Bước D — UI/UX facelift có hệ thống
-- Dọn cấu trúc React: tách component, types rõ, state management gọn.
-- Cải thiện trải nghiệm kết nối và thao tác.
+If you find a high-risk flow, prefer:
+- Safer alternatives (e.g., “disable feature”, “require explicit opt-in UI + server-side check”, “remove dangerous defaults”).
 
 ---
 
-## 4) Build/Run/Test — Quy tắc chung
+## 3) Standard workflow (recommended)
+### Step A — Survey & plan
+1) Understand architecture: C++ server/client, web client, WebSocket message flow, command dispatcher.
+2) List likely problems:
+   - Build/CMake/presets/toolchains, include paths, standard flags, warnings-as-errors.
+   - WebSocket: parsing, concurrency, disconnect handling, ping/pong, reconnection strategy.
+   - Modules: system/screen/process/camera permissions, OS-specific failures.
+3) Record “Top issues” by severity + reproduction steps.
+
+### Step B — Make it run
+- Prioritize getting **build stable** (C++ and web).
+- Add short run/build notes (README or PR description) if helpful.
+
+### Step C — Fix bugs in small iterations
+For each bugfix:
+1) Provide clear reproduction (or logs/trace).
+2) Apply minimal, targeted fix (avoid rewrites).
+3) Add tests if a test framework exists.
+4) If no tests exist: add validation/logging/sanity checks to reduce regressions.
+
+### Step D — UI/UX facelift (structured)
+- Improve React structure: componentization, clean types, lean state handling.
+- Improve connection + action feedback (status, errors, notifications).
+
+---
+
+## 4) Build / Run / Test rules
 ### C++ (CMake)
-- Ưu tiên dùng `CMakePresets.json` nếu có presets hợp lệ.
-- Nếu không rõ lệnh:
-  - Agent phải đọc `CMakeLists.txt` và `CMakePresets.json` để suy ra cách build đúng,
-  - sau đó cập nhật phần “Build notes” trong commit message hoặc ghi chú.
+- Prefer `CMakePresets.json` if valid presets exist.
+- If unclear:
+  - Read `CMakeLists.txt` and `CMakePresets.json` to infer build steps,
+  - Then document “Build notes” in the PR.
 
-Những việc bắt buộc khi sửa C++:
-- Bật warning hợp lý (không phá build), giảm UB.
-- Kiểm tra memory/resource leaks ở các luồng network/dispatcher.
-- Chuẩn hoá error handling: trả về lỗi có mã/chuỗi rõ ràng.
+Mandatory when changing C++:
+- Keep warnings reasonable without breaking builds.
+- Reduce UB and improve error handling paths.
+- Standardize error reporting: structured codes/messages when possible.
+
+**Codex/Linux environment note:**
+- Codex cloud usually runs on Linux. Windows-only presets (e.g., MinGW) may fail.
+- If needed, add a Linux preset (e.g., `codex-linux`) while keeping Windows presets intact.
 
 ### Web (Vite + React + Tailwind)
-- Đọc `package.json` để xác định scripts (dev/build/lint/typecheck).
-- Đảm bảo:
-  - `npm install` / `pnpm install` chạy được,
-  - `npm run dev` chạy,
-  - `npm run build` không lỗi TypeScript,
-  - (nếu có) `npm run lint` pass.
+- Read `client/web/package.json` for scripts.
+- Ensure:
+  - `npm ci` (or `npm install`) works,
+  - `npm run dev` works (when possible),
+  - `npm run build` has no TypeScript errors,
+  - `npm run lint` passes if present.
 
 ---
 
-## 5) Tiêu chuẩn chất lượng code (C++)
-- Không dùng `using namespace std;` trong header.
-- Header include guard hoặc `#pragma once` nhất quán.
-- Tránh include dư thừa, giảm coupling.
-- Không để “magic string” cho command; nên centralize (enum/string constants).
-- Tất cả message WebSocket phải có validation:
-  - schema tối thiểu (type, payload),
-  - size limit,
-  - xử lý case thiếu field/sai type,
-  - reject input nguy hiểm.
+## 5) C++ code quality standards
+- Do not use `using namespace std;` in headers.
+- Use include guards or `#pragma once` consistently.
+- Avoid unnecessary includes; reduce coupling.
+- Avoid magic strings for commands; centralize constants (enum/string constants).
+- All WebSocket messages must have validation:
+  - minimal schema (`type`, `payload`),
+  - size limits,
+  - handle missing fields / wrong types,
+  - reject dangerous or unexpected input.
+- Prefer RAII, avoid raw owning pointers, close resources deterministically.
 
-## 6) Tiêu chuẩn chất lượng code (Web)
-- TypeScript strict-friendly (tránh `any`).
-- Tách `types.ts` chuẩn: message types, API contracts.
-- UI phải có:
-  - Thanh trạng thái kết nối (Connected/Disconnected/Connecting).
-  - Thông báo lỗi rõ ràng (toast/alert).
+---
+
+## 6) Web code quality standards
+- TypeScript strict-friendly (avoid `any`).
+- Keep `types.ts` clean: message types, API contracts, shared domain types.
+- UI must include:
+  - Connection status (Connected / Disconnected / Connecting).
+  - Clear error messaging (toast/alert).
   - Empty-state + loading-state.
-  - Layout responsive (mobile/desktop).
-  - Chủ đề màu/typography nhất quán (Tailwind), spacing chuẩn.
-  - Accessibility cơ bản: focus ring, aria-label cho nút quan trọng.
+  - Responsive layout (mobile/desktop).
+  - Consistent theme/typography (Tailwind spacing + tokens).
+  - Basic accessibility: focus ring, aria-labels for key buttons.
 
-Gợi ý UI/UX hướng “modern”:
-- App layout dạng: Sidebar (actions) + Main panel (logs/results) hoặc topbar + cards.
-- Dùng “card”, “badge”, “chip”, “toast”, “modal confirm” (đặc biệt cho thao tác nguy hiểm).
-- Dark mode (nếu dễ làm) và lưu preference.
-
----
-
-## 7) Nguyên tắc riêng cho WebSocket & Command Dispatcher
-- Chuẩn hoá format message (ví dụ):
-  - `type`: string
-  - `requestId`: string (để map request/response)
-  - `payload`: object
-  - `timestamp`: number (optional)
-  - `error`: { code, message } (optional)
-
-- Dispatcher:
-  - Không crash khi nhận command lạ.
-  - Command handler phải trả lỗi có cấu trúc.
-  - Timeout cho request nếu có.
-  - Logging có mức: info/warn/error.
-
-- Consent gate:
-  - Những command “nhạy cảm” (system_control/screen/camera/process/keylogger nếu còn tồn tại)
-    phải check consent trước khi chạy.
+Modern UI/UX direction:
+- Layout: Sidebar (actions) + Main panel (logs/results) OR topbar + cards.
+- Use “cards”, “badges/chips”, “toast”, “confirm modal” (especially for risky actions).
+- Optional: dark mode + persist preference.
 
 ---
 
-## 8) Checklist “Done” (đầu ra bắt buộc)
+## 7) WebSocket & command dispatcher rules
+Recommended message format:
+- `type`: string
+- `requestId`: string (map request/response)
+- `payload`: object
+- `timestamp`: number (optional)
+- `error`: `{ code, message }` (optional)
+
+Dispatcher requirements:
+- Must not crash on unknown commands.
+- Handlers return structured errors.
+- Add request timeout when applicable.
+- Logging levels: info/warn/error.
+
+Consent gate:
+- Sensitive commands (system_control/screen/camera/process/keylogger if present) must verify consent before execution.
+
+---
+
+## 8) Branch, PR, and change management (IMPORTANT)
+- Work on a dedicated branch (e.g., `codex/...`).
+- Keep PRs small and focused:
+  - One PR = one logical fix (build fix, merge fix, preset fix, UI improvement, etc.)
+- Do not mix unrelated refactors with build portability changes.
+- Never “fix” TypeScript build by weakening strictness. Fix the code.
+
+---
+
+## 9) Definition of Done checklist
 ### Bugfix
-- [ ] Dự án build được (ít nhất 1 cấu hình hợp lệ).
-- [ ] Fix các lỗi rõ ràng trong các file phạm vi.
-- [ ] Không còn crash obvious khi kết nối/disconnect WS.
-- [ ] Validation message vào/ra đầy đủ hơn trước.
-- [ ] Logging/handling lỗi rõ ràng.
+- [ ] Project builds (at least one valid configuration).
+- [ ] Clear bugs within scoped files fixed.
+- [ ] No obvious crashes on WebSocket connect/disconnect.
+- [ ] Improved message validation.
+- [ ] Clear logging/error handling.
 
 ### UI/UX
-- [ ] Giao diện hiện đại hơn, spacing/typography tốt, responsive.
-- [ ] Có trạng thái kết nối + thông báo lỗi.
-- [ ] Luồng thao tác rõ ràng, ít “mù mờ”.
+- [ ] UI is more modern, with better spacing/typography, responsive.
+- [ ] Connection status + error notifications exist.
+- [ ] Flows are clear and consistent.
 
-### An toàn
-- [ ] Các tính năng nhạy cảm bị vô hiệu hoá mặc định hoặc yêu cầu consent rõ ràng.
-- [ ] Không thêm bất kỳ hành vi thu thập trái phép/ẩn giấu.
+### Safety
+- [ ] Sensitive features disabled by default OR require explicit consent.
+- [ ] No stealth/unauthorized data collection added.
 
 ---
 
-## 9) Cách bạn nên báo cáo kết quả
-Khi hoàn thành, Agent phải tóm tắt:
-1) Các bug đã tìm thấy + cách tái hiện + cách fix.
-2) Những thay đổi UI/UX (kèm ảnh/chụp màn hình nếu có thể).
-3) Những thay đổi liên quan an toàn/consent.
-4) Các lệnh build/run đã xác nhận chạy được.
+## 10) Reporting format
+When done, summarize:
+1) Bugs found + reproduction + fix.
+2) UI/UX changes (screenshots if possible).
+3) Safety/consent changes.
+4) Verified build/run commands.
 
-Kết thúc file.
+End of file.
