@@ -13,4 +13,14 @@
       }
     ]
   }
-  
+
+{
+  "name": "codex-linux",
+  "displayName": "Codex Linux (Ninja + optional vcpkg)",
+  "generator": "Ninja",
+  "binaryDir": "${sourceDir}/build/codex-linux",
+  "cacheVariables": {
+    "CMAKE_BUILD_TYPE": "Release",
+    "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/cmake/toolchains/vcpkg_optional.cmake"
+  }
+}
