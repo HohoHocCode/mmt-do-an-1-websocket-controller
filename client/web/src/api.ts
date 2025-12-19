@@ -1,7 +1,9 @@
 import { AuthUser, ControllerStatus, DiscoveryDevice } from "./types";
 
-const RAW_API_URL = import.meta.env.VITE_API_URL || "";
-const API_URL = RAW_API_URL.endsWith("/") ? RAW_API_URL.slice(0, -1) : RAW_API_URL;
+const RAW_API_URL = (import.meta.env.VITE_API_URL ?? "").trim();
+const DEFAULT_API_BASE = "/api";
+const API_BASE = RAW_API_URL === "" ? DEFAULT_API_BASE : RAW_API_URL;
+const API_URL = API_BASE.endsWith("/") ? API_BASE.slice(0, -1) : API_BASE;
 
 export class ApiError extends Error {
   status?: number;
@@ -39,35 +41,35 @@ export type LoginResponse = { token: string; user: AuthUser };
 export type StatusResponse = { exists: boolean; hasPassword: boolean };
 
 export function precheckUser(username: string) {
-  return request<StatusResponse>("/api/auth/precheck", {
+  return request<StatusResponse>("/auth/precheck", {
     method: "POST",
     body: JSON.stringify({ username }),
   });
 }
 
 export function registerUser(payload: { username: string; password?: string }) {
-  return request<{ ok: boolean; user?: AuthUser; error?: string }>("/api/auth/register", {
+  return request<{ ok: boolean; user?: AuthUser; error?: string }>("/auth/register", {
     method: "POST",
     body: JSON.stringify(payload),
   });
 }
 
 export function setPassword(payload: { username: string; password: string }) {
-  return request<{ ok: boolean; error?: string }>("/api/auth/set-password", {
+  return request<{ ok: boolean; error?: string }>("/auth/set-password", {
     method: "POST",
     body: JSON.stringify(payload),
   });
 }
 
 export function login(payload: { username: string; password: string }) {
-  return request<LoginResponse>("/api/auth/login", {
+  return request<LoginResponse>("/auth/login", {
     method: "POST",
     body: JSON.stringify(payload),
   });
 }
 
 export function verifyToken(token: string) {
-  return request<{ ok: boolean; user?: AuthUser }>("/api/auth/verify", {
+  return request<{ ok: boolean; user?: AuthUser }>("/auth/verify", {
     method: "POST",
     body: JSON.stringify({ token }),
   });
@@ -75,7 +77,7 @@ export function verifyToken(token: string) {
 
 export function logAudit(token: string, action: string, meta: Record<string, unknown> = {}) {
   return request<{ ok: boolean }>(
-    "/api/audit",
+    "/audit",
     { method: "POST", body: JSON.stringify({ action, meta }) },
     token
   );
@@ -83,20 +85,20 @@ export function logAudit(token: string, action: string, meta: Record<string, unk
 
 export function discoverDevices(token: string, payload?: { timeoutMs?: number; retries?: number; port?: number }) {
   return request<{ ok: boolean; devices: DiscoveryDevice[] }>(
-    "/api/discover/start",
+    "/discover/start",
     { method: "POST", body: JSON.stringify(payload ?? {}) },
     token
   );
 }
 
 export function getControllerStatus(token: string) {
-  return request<{ ok: boolean; status: ControllerStatus }>("/api/controller/status", { method: "GET" }, token);
+  return request<{ ok: boolean; status: ControllerStatus }>("/controller/status", { method: "GET" }, token);
 }
 
 export function restartController(token: string) {
-  return request<{ ok: boolean; status: ControllerStatus }>("/api/controller/restart", { method: "POST" }, token);
+  return request<{ ok: boolean; status: ControllerStatus }>("/controller/restart", { method: "POST" }, token);
 }
 
 export function stopController(token: string) {
-  return request<{ ok: boolean; status: ControllerStatus }>("/api/controller/stop", { method: "POST" }, token);
+  return request<{ ok: boolean; status: ControllerStatus }>("/controller/stop", { method: "POST" }, token);
 }
