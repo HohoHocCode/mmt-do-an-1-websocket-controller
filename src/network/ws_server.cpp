@@ -15,12 +15,17 @@
 #include <chrono>
 #include <optional>
 #include <cstdlib>
+#include <thread>
+#include <atomic>
+#include <array>
+#include <cctype>
 
 namespace asio  = boost::asio;
 namespace beast = boost::beast;
 namespace http  = beast::http;
 namespace ws    = beast::websocket;
 using tcp       = asio::ip::tcp;
+using udp       = asio::ip::udp;
 
 struct ParsedUrl {
     std::string host = "localhost";
@@ -32,6 +37,33 @@ struct VerifiedUser {
     std::string username;
     std::string role;
 };
+
+static std::string env_string(const char* key, const std::string& fallback) {
+    const char* val = std::getenv(key);
+    if (val && *val) return std::string(val);
+    return fallback;
+}
+
+static unsigned short env_port(const char* key, unsigned short fallback) {
+    const char* val = std::getenv(key);
+    if (!val || !*val) return fallback;
+    try {
+        int parsed = std::stoi(val);
+        if (parsed > 0 && parsed < 65536) return static_cast<unsigned short>(parsed);
+    } catch (...) {
+    }
+    return fallback;
+}
+
+static bool env_flag(const char* key, bool fallback) {
+    const char* val = std::getenv(key);
+    if (!val) return fallback;
+    std::string s(val);
+    for (auto& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (s == "1" || s == "true" || s == "yes" || s == "on") return true;
+    if (s == "0" || s == "false" || s == "no" || s == "off") return false;
+    return fallback;
+}
 
 static ParsedUrl parse_base_url(const std::string& url) {
     ParsedUrl result;
@@ -134,6 +166,125 @@ static void send_audit_remote(const std::string& base_url, const std::string& to
         std::cerr << "[Audit] send failed: " << e.what() << "\n";
     }
 }
+
+// ============================================================================
+// DiscoveryResponder (UDP)
+// ============================================================================
+class DiscoveryResponder {
+public:
+    DiscoveryResponder(unsigned short listen_port, unsigned short ws_port)
+        : socket_(io_)
+        , listen_port_(listen_port)
+        , ws_port_(ws_port)
+        , name_(env_string("AGENT_NAME", "mmt-controller"))
+        , version_(env_string("AGENT_VERSION", "dev"))
+    {}
+
+    ~DiscoveryResponder() {
+        stop();
+    }
+
+    bool start() {
+        if (running_) return true;
+
+        boost::system::error_code ec;
+        udp::endpoint ep(udp::v4(), listen_port_);
+        socket_.open(ep.protocol(), ec);
+        if (ec) {
+            std::cerr << "[Discovery] open failed: " << ec.message() << "\n";
+            return false;
+        }
+        socket_.set_option(asio::socket_base::reuse_address(true), ec);
+        socket_.set_option(asio::socket_base::broadcast(true), ec);
+        socket_.bind(ep, ec);
+        if (ec) {
+            std::cerr << "[Discovery] bind failed: " << ec.message() << "\n";
+            return false;
+        }
+
+        running_ = true;
+        do_receive();
+        worker_ = std::thread([this]() { io_.run(); });
+        std::cout << "[Discovery] Listening for MMT_DISCOVER on UDP " << listen_port_ << "\n";
+        return true;
+    }
+
+    void stop() {
+        if (!running_) return;
+        running_ = false;
+        boost::system::error_code ec;
+        socket_.close(ec);
+        io_.stop();
+        if (worker_.joinable()) worker_.join();
+        io_.restart();
+    }
+
+private:
+    asio::io_context io_;
+    udp::socket socket_;
+    udp::endpoint remote_endpoint_;
+    std::array<char, 2048> buffer_{};
+    std::thread worker_;
+    unsigned short listen_port_;
+    unsigned short ws_port_;
+    std::string name_;
+    std::string version_;
+    std::atomic<bool> running_{false};
+
+    void do_receive() {
+        socket_.async_receive_from(
+            asio::buffer(buffer_),
+            remote_endpoint_,
+            [this](boost::system::error_code ec, std::size_t bytes) {
+                if (ec) {
+                    if (running_) {
+                        do_receive();
+                    }
+                    return;
+                }
+                handle_receive(bytes);
+                if (running_) {
+                    do_receive();
+                }
+            }
+        );
+    }
+
+    void handle_receive(std::size_t bytes) {
+        if (bytes == 0) return;
+        const std::string text(buffer_.data(), buffer_.data() + bytes);
+        if (text.rfind("MMT_DISCOVER", 0) != 0) return;
+
+        std::string nonce;
+        auto space_pos = text.find(' ');
+        if (space_pos != std::string::npos && space_pos + 1 < text.size()) {
+            nonce = text.substr(space_pos + 1);
+            if (nonce.size() > 64) {
+                nonce = nonce.substr(0, 64);
+            }
+        }
+
+        Json payload;
+        payload["type"] = "mmt_discover_response";
+        payload["nonce"] = nonce;
+        payload["wsPort"] = ws_port_;
+        payload["name"] = name_;
+        payload["version"] = version_;
+        payload["ip"] = remote_endpoint_.address().to_string();
+        payload["timestamp"] = static_cast<long long>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()
+            ).count()
+        );
+
+        auto message = std::make_shared<std::string>(payload.dump());
+        socket_.async_send_to(
+            asio::buffer(*message),
+            remote_endpoint_,
+            [message](boost::system::error_code /*ec*/, std::size_t /*bytes*/) {}
+        );
+    }
+};
 
 // ============================================================================
 // WebSocketSession
@@ -458,12 +609,28 @@ private:
 // ============================================================================
 struct WsServer::Impl {
     asio::io_context ioc;
+    std::unique_ptr<DiscoveryResponder> discovery;
 
     void start(const std::string& addr, unsigned short port) {
+        const bool enable_discovery = env_flag("DISCOVERY_ENABLED", true);
+        const unsigned short discovery_port = env_port("DISCOVERY_PORT", 41000);
+        if (enable_discovery) {
+            auto responder = std::make_unique<DiscoveryResponder>(discovery_port, port);
+            if (responder->start()) {
+                discovery = std::move(responder);
+            } else {
+                std::cerr << "[Discovery] Disabled (failed to bind port " << discovery_port << ")\n";
+            }
+        }
+
         tcp::endpoint ep(asio::ip::make_address(addr), port);
         std::make_shared<Listener>(ioc, ep)->run();
         std::cout << "[WsServer] Listening on " << addr << ":" << port << "\n";
         ioc.run();
+
+        if (discovery) {
+            discovery->stop();
+        }
     }
 };
 

@@ -1,4 +1,4 @@
-import { AuthUser } from "./types";
+import { AuthUser, ControllerStatus, DiscoveryDevice } from "./types";
 
 const API_URL = import.meta.env.VITE_API_URL || "http://localhost:5179";
 
@@ -71,6 +71,22 @@ export function logAudit(token: string, action: string, meta: Record<string, unk
   );
 }
 
-export function discoverDevices(token: string) {
-  return request<{ devices: Array<Record<string, unknown>> }>("/devices/discover", { method: "GET" }, token);
+export function discoverDevices(token: string, payload?: { timeoutMs?: number; retries?: number }) {
+  return request<{ ok: boolean; devices: DiscoveryDevice[] }>(
+    "/api/discover",
+    { method: "POST", body: JSON.stringify(payload ?? {}) },
+    token
+  );
+}
+
+export function getControllerStatus(token: string) {
+  return request<{ ok: boolean; status: ControllerStatus }>("/api/controller/status", { method: "GET" }, token);
+}
+
+export function restartController(token: string) {
+  return request<{ ok: boolean; status: ControllerStatus }>("/api/controller/restart", { method: "POST" }, token);
+}
+
+export function stopController(token: string) {
+  return request<{ ok: boolean; status: ControllerStatus }>("/api/controller/stop", { method: "POST" }, token);
 }

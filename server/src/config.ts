@@ -26,6 +26,16 @@ const envSchema = z.object({
   AUTH_TOKEN_TTL_SECONDS: z.coerce.number().int().positive().default(86400),
   BACKEND_PORT: z.coerce.number().int().positive().default(5179),
   DISCOVERY_PORT: z.coerce.number().int().positive().default(41000),
+  DISCOVERY_TIMEOUT_MS: z.coerce.number().int().positive().default(1800),
+  DISCOVERY_RETRIES: z.coerce.number().int().positive().max(5).default(2),
+  CONTROLLER_CMD: z.string().default(""),
+  CONTROLLER_ARGS: z.string().default(""),
+  CONTROLLER_WORKDIR: z.string().default(""),
+  CONTROLLER_GRACE_MS: z.coerce.number().int().positive().default(1200),
+  CONTROLLER_AUTO_START: z
+    .union([z.literal("1"), z.literal("0"), z.literal("true"), z.literal("false"), z.literal(""), z.boolean()])
+    .optional()
+    .default("0"),
 });
 
 export const config = envSchema.parse(process.env);
