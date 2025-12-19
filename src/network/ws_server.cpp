@@ -294,6 +294,7 @@ public:
     explicit WebSocketSession(tcp::socket socket)
         : ws_(std::move(socket))
         , stream_timer_(ws_.get_executor())   // timer dùng chung executor với websocket
+        , stream_guard_timer_(ws_.get_executor())
         , auth_api_base_(std::getenv("AUTH_API_URL") ? std::getenv("AUTH_API_URL") : "http://localhost:5179")
     {}
 
@@ -319,10 +320,12 @@ private:
 
     // Stream state
     asio::steady_timer stream_timer_;
+    asio::steady_timer stream_guard_timer_;
     bool streaming_ = false;
     int stream_seq_ = 0;
     int stream_interval_ms_ = 0;
     int stream_total_frames_ = 0;
+    std::uint64_t stream_generation_ = 0;
 
 
     // ------------------------------------------------------------------------
@@ -419,12 +422,21 @@ private:
                 }
 
                 if (cmd == "cancel_all") {
-                    streaming_ = false;
-                    beast::error_code cancel_ec;
-                    stream_timer_.cancel(cancel_ec);
+                    stop_stream("cancel_all");
                     Json ack;
                     ack["cmd"] = "cancel_all";
                     ack["status"] = "ok";
+                    send_text(ack.dump());
+                    do_read();
+                    return;
+                }
+
+                if (cmd == "reset") {
+                    stop_stream("reset");
+                    Json ack;
+                    ack["cmd"] = "reset";
+                    ack["status"] = "ok";
+                    ack["message"] = "Session reset";
                     send_text(ack.dump());
                     do_read();
                     return;
@@ -483,11 +495,21 @@ private:
         if (fps < 1) fps = 1;
         if (fps > 30) fps = 30;
         if (duration < 1) duration = 3;
+        if (duration > 60) duration = 60;
 
         streaming_ = true;
         stream_seq_ = 0;
         stream_interval_ms_ = 1000 / fps;
         stream_total_frames_ = duration * fps;
+        stream_generation_++;
+        const auto generation = stream_generation_;
+
+        stream_guard_timer_.expires_after(std::chrono::seconds(60));
+        stream_guard_timer_.async_wait([self = shared_from_this(), generation](const beast::error_code& ec) {
+            if (!ec && generation == self->stream_generation_) {
+                self->stop_stream("timeout");
+            }
+        });
 
         std::cout << "[WsServer] Streaming start: "
                   << fps << " fps, "
@@ -496,28 +518,38 @@ private:
 
         stream_timer_.expires_after(std::chrono::milliseconds(stream_interval_ms_));
         stream_timer_.async_wait(
-            beast::bind_front_handler(
-                &WebSocketSession::do_stream_frame,
-                shared_from_this()
-            )
+            [self = shared_from_this(), generation](const beast::error_code& ec) {
+                self->do_stream_frame(ec, generation);
+            }
         );
     }
 
     // ------------------------------------------------------------------------
-    void do_stream_frame(beast::error_code ec) {
-        if (ec == asio::error::operation_aborted) return;
+    void stop_stream(const std::string& reason) {
         if (!streaming_) return;
+        streaming_ = false;
+        stream_generation_++;
+        beast::error_code cancel_ec;
+        stream_timer_.cancel(cancel_ec);
+        stream_guard_timer_.cancel(cancel_ec);
+        std::cout << "[WsServer] Stream stopped (" << reason << ")\n";
+    }
+
+    // ------------------------------------------------------------------------
+    void do_stream_frame(beast::error_code ec, std::uint64_t generation) {
+        if (ec == asio::error::operation_aborted) return;
+        if (!streaming_ || generation != stream_generation_) return;
 
         if (stream_seq_ >= stream_total_frames_) {
             std::cout << "[WsServer] Stream finished\n";
-            streaming_ = false;
+            stop_stream("complete");
             return;
         }
 
         std::string b64 = ScreenCapture::capture_base64();
         if (b64.empty()) {
             std::cerr << "[WsServer] ScreenCapture failed\n";
-            streaming_ = false;
+            stop_stream("capture_failed");
             return;
         }
 
@@ -535,7 +567,7 @@ private:
                 if (ec) {
                     std::cerr << "[WsServer] Stream write error: "
                               << ec.message() << "\n";
-                    self->streaming_ = false;
+                    self->stop_stream("write_failed");
                     return;
                 }
 
@@ -548,10 +580,9 @@ private:
                 );
 
                 self->stream_timer_.async_wait(
-                    beast::bind_front_handler(
-                        &WebSocketSession::do_stream_frame,
-                        self
-                    )
+                    [self, generation](const beast::error_code& timer_ec) {
+                        self->do_stream_frame(timer_ec, generation);
+                    }
                 );
             }
         );
