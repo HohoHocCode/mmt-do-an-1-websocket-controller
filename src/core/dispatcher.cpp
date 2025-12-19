@@ -178,7 +178,7 @@ Json Dispatcher::handle_camera(const Json& req)
     Camera cam;
     std::string b64;
 
-    if (cam.captureFrame(b64)) {
+    if (cam.capture_frame(b64)) {
         Json resp;
         resp["image_base64"] = b64;
         return resp;
@@ -202,7 +202,7 @@ Json Dispatcher::handle_camera_video(const Json& req)
     std::string b64video;
     std::string format;
 
-    if (!cam.captureVideo(duration, b64video, format)) {
+    if (!cam.capture_video(duration, b64video, format)) {
         Json err;
         err["cmd"] = "camera_video";
         err["status"] = "error";

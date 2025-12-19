@@ -12,12 +12,12 @@ public:
     void close();
 
     // Chụp 1 frame (đã có)
-    bool captureFrame(std::string& out_base64_jpeg);
+    bool capture_frame(std::string& out_base64_jpeg);
 
     // QUAY VIDEO: durationSeconds ~10s, trả về base64 của file video
-    bool captureVideo(int durationSeconds,
-                      std::string& out_base64_video,
-                      std::string& out_format); // ví dụ "avi"
+    bool capture_video(int durationSeconds,
+                       std::string& out_base64_video,
+                       std::string& out_format); // ví dụ "avi"
 
 private:
     cv::VideoCapture cap;

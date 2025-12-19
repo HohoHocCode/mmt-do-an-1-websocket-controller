@@ -26,7 +26,7 @@ void Camera::close() {
         cap.release();
 }
 
-bool Camera::captureFrame(std::string& out_base64_jpeg)
+bool Camera::capture_frame(std::string& out_base64_jpeg)
 {
     if (!cap.isOpened()) {
         if (!cap.open(0))
@@ -46,9 +46,9 @@ bool Camera::captureFrame(std::string& out_base64_jpeg)
 }
 
 // QUAY VIDEO ~durationSeconds, trả base64 video (offline)
-bool Camera::captureVideo(int durationSeconds,
-                          std::string& out_base64_video,
-                          std::string& out_format)
+bool Camera::capture_video(int durationSeconds,
+                           std::string& out_base64_video,
+                           std::string& out_format)
 {
     if (durationSeconds <= 0)
         return false;
