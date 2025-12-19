@@ -49,3 +49,10 @@ export interface ControllerStatus {
   message?: string;
   command?: string;
 }
+
+export interface WsMessage {
+  cmd?: string;
+  status?: string;
+  requestId?: string;
+  [key: string]: unknown;
+}

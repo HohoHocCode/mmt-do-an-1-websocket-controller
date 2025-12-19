@@ -31,7 +31,7 @@ import {
 import LoginPage from "./LoginPage";
 import { useAuth } from "./auth";
 import { ApiError, discoverDevices, getControllerStatus, logAudit, restartController, stopController } from "./api";
-import type { AuthUser, ControllerStatus, DiscoveryDevice, HotkeyAction, HotkeyMap } from "./types";
+import type { AuthUser, ControllerStatus, DiscoveryDevice, HotkeyAction, HotkeyMap, WsMessage } from "./types";
 
 // [ADDED] App name (để LoginPage / Header dùng thống nhất)
 const APP_NAME = import.meta.env.VITE_APP_NAME || "Remote Desktop Control"; // [ADDED]
@@ -89,6 +89,11 @@ interface TargetActivity {
   updatedAt: number;
 }
 
+interface PendingAction {
+  requestId: string;
+  startedAt: number;
+}
+
 interface ToastPayload {
   text: string;
   tone: "info" | "success" | "error";
@@ -112,6 +117,7 @@ interface RemoteTarget {
   stream: StreamState;
   activity: TargetActivity;
   lastError?: string | null;
+  pending: Record<string, PendingAction | undefined>;
 }
 
 const DEFAULT_PORT = 9002;
@@ -125,6 +131,13 @@ const DEFAULT_HOTKEYS: HotkeyMap = {
   processes: "ctrl+shift+p",
 };
 const createId = () => `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+const createRequestId = () => {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return crypto.randomUUID();
+  }
+  return `req-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+};
+const ACTION_TIMEOUT_MS = 20000;
 
 function formatTime(date: Date) {
   return date.toLocaleTimeString();
@@ -256,6 +269,8 @@ export default function App() {
   const logsEndRef = useRef<HTMLDivElement | null>(null);
   const activityTimers = useRef<Record<string, ReturnType<typeof setTimeout> | undefined>>({});
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingActionsRef = useRef<Record<string, Record<string, PendingAction | undefined>>>({});
+  const pendingTimeoutsRef = useRef<Record<string, ReturnType<typeof setTimeout> | undefined>>({});
   const hotkeyHandlerRef = useRef<(action: HotkeyAction) => void>(() => {});
   const [discovering, setDiscovering] = useState(false);
   const [discoveredDevices, setDiscoveredDevices] = useState<DiscoveryDevice[]>([]);
@@ -290,7 +305,9 @@ export default function App() {
   const anyConnected = selectedTargets.some((t) => t.connected);
   const anyBusy = selectedTargets.some((t) => t.activity.state === "running");
   const canSend = selectedTargets.length > 0 && anyConnected && !!token && !locked;
-  const actionsDisabled = !canSend || anyBusy;
+  const actionsDisabled = !canSend;
+  const activePending = active?.pending ?? {};
+  const isPendingForActive = (cmd: string) => Boolean(activePending[cmd]);
 
   useEffect(() => {
     if (!activeId && targets.length > 0) setActiveId(targets[0].id);
@@ -329,6 +346,9 @@ export default function App() {
           } catch {}
         });
         Object.values(activityTimers.current).forEach((timer) => {
+          if (timer) clearTimeout(timer);
+        });
+        Object.values(pendingTimeoutsRef.current).forEach((timer) => {
           if (timer) clearTimeout(timer);
         });
         if (toastTimer.current) clearTimeout(toastTimer.current);
@@ -392,6 +412,68 @@ export default function App() {
     setTargets((prev) =>
       prev.map((t) => (t.id === id ? { ...t, lastError: label } : t))
     );
+  };
+
+  const pendingKey = (id: string, cmd: string) => `${id}:${cmd}`;
+
+  const isActionPending = (id: string, cmd: string) =>
+    Boolean(pendingActionsRef.current[id]?.[cmd]);
+
+  const setPendingAction = (id: string, cmd: string, requestId: string, label?: string) => {
+    const key = pendingKey(id, cmd);
+    if (pendingTimeoutsRef.current[key]) {
+      clearTimeout(pendingTimeoutsRef.current[key]);
+    }
+    const startedAt = Date.now();
+    if (!pendingActionsRef.current[id]) {
+      pendingActionsRef.current[id] = {};
+    }
+    pendingActionsRef.current[id][cmd] = { requestId, startedAt };
+    setTargets((prev) =>
+      prev.map((t) =>
+        t.id === id
+          ? { ...t, pending: { ...t.pending, [cmd]: { requestId, startedAt } } }
+          : t
+      )
+    );
+    pendingTimeoutsRef.current[key] = setTimeout(() => {
+      clearPendingAction(id, cmd);
+      markError(id, `${label || cmd} timeout`);
+      showToast({ text: `${label || cmd} timeout`, tone: "error" });
+    }, ACTION_TIMEOUT_MS);
+  };
+
+  const clearPendingAction = (id: string, cmd: string) => {
+    const key = pendingKey(id, cmd);
+    if (pendingTimeoutsRef.current[key]) {
+      clearTimeout(pendingTimeoutsRef.current[key]);
+      pendingTimeoutsRef.current[key] = undefined;
+    }
+    if (pendingActionsRef.current[id]) {
+      delete pendingActionsRef.current[id][cmd];
+    }
+    setTargets((prev) =>
+      prev.map((t) => {
+        if (t.id !== id) return t;
+        const { [cmd]: _, ...rest } = t.pending;
+        return { ...t, pending: rest };
+      })
+    );
+  };
+
+  const clearPendingByRequestId = (id: string, requestId: string) => {
+    const pending = pendingActionsRef.current[id];
+    if (!pending) return;
+    const cmd = Object.keys(pending).find((key) => pending[key]?.requestId === requestId);
+    if (cmd) {
+      clearPendingAction(id, cmd);
+    }
+  };
+
+  const clearAllPending = (id: string) => {
+    const pending = pendingActionsRef.current[id];
+    if (!pending) return;
+    Object.keys(pending).forEach((cmd) => clearPendingAction(id, cmd));
   };
 
   const toggleBroadcastSelection = (id: string) => {
@@ -504,6 +586,7 @@ export default function App() {
       stream: { running: false, fps: 5, duration: 5, lastSeq: -1 },
       activity: { state: "idle", label: "Disconnected", updatedAt: Date.now() },
       lastError: null,
+      pending: {},
     };
 
     setTargets((prev) => [...prev, t]);
@@ -541,6 +624,7 @@ export default function App() {
       stream: { running: false, fps: 5, duration: 5, lastSeq: -1 },
       activity: { state: "running", label: "Connecting", updatedAt: Date.now() },
       lastError: null,
+      pending: {},
     };
     setTargets((prev) => [...prev, target]);
     setActiveId(id);
@@ -574,6 +658,7 @@ export default function App() {
   };
 
   const disconnectTarget = (id: string) => {
+    clearAllPending(id);
     setTargets((prev) =>
       prev.map((t) => {
         if (t.id !== id) return t;
@@ -591,6 +676,7 @@ export default function App() {
           lastVideo: t.lastVideo ? { ...t.lastVideo, url: undefined } : undefined,
           activity: { state: "idle", label: "Disconnected", updatedAt: Date.now() },
           lastError: null,
+          pending: {},
         };
       })
     );
@@ -636,6 +722,7 @@ export default function App() {
 
         ws.onclose = () => {
           addLog(id, "Disconnected", "error");
+          clearAllPending(id);
           setTargets((inner) =>
             inner.map((x) => {
               if (x.id !== id) return x;
@@ -650,6 +737,7 @@ export default function App() {
                 authStatus: "idle",
                 authUser: null,
                 activity: { state: "idle", label: "Disconnected", updatedAt: Date.now() },
+                pending: {},
               };
             })
           );
@@ -661,7 +749,10 @@ export default function App() {
             addLog(id, `RAW: ${String(evt.data)}`, "info");
             return;
           }
-          const data = parsed as Record<string, unknown>;
+          const data = parsed as WsMessage;
+          if (typeof data.requestId === "string") {
+            clearPendingByRequestId(id, data.requestId);
+          }
 
           if (data.cmd === "auth") {
             const status = typeof data.status === "string" ? data.status : "error";
@@ -799,66 +890,121 @@ export default function App() {
     );
   };
 
+  const extractCommand = (payload: unknown) => {
+    if (!payload || typeof payload !== "object") return null;
+    const cmdValue = (payload as { cmd?: unknown }).cmd;
+    return typeof cmdValue === "string" ? cmdValue : null;
+  };
+
+  const attachRequestId = (payload: unknown, requestId: string) => {
+    if (!payload || typeof payload !== "object") return payload;
+    return { ...(payload as Record<string, unknown>), requestId };
+  };
+
   const sendJsonToTarget = (id: string, payload: unknown, label?: string) => {
+    const cmd = extractCommand(payload);
+    if (cmd && isActionPending(id, cmd)) {
+      showToast({ text: `Action "${cmd}" is already running`, tone: "info" });
+      return false;
+    }
+
+    const target = targets.find((t) => t.id === id);
+    if (!target) return false;
+
+    if (locked) {
+      setTargets((prev) =>
+        prev.map((t) =>
+          t.id === id
+            ? {
+                ...t,
+                logs: [
+                  ...t.logs,
+                  { text: "Session locked. Please sign in again to run actions.", type: "error" as LogType, timestamp: new Date() },
+                ].slice(-LOG_LIMIT),
+                activity: { state: "error", label: "Session locked", updatedAt: Date.now() },
+                lastError: "Session locked",
+              }
+            : t
+        )
+      );
+      return false;
+    }
+    if (!token) {
+      setTargets((prev) =>
+        prev.map((t) =>
+          t.id === id
+            ? {
+                ...t,
+                logs: [
+                  ...t.logs,
+                  { text: "Missing auth token. Please login again.", type: "error" as LogType, timestamp: new Date() },
+                ].slice(-LOG_LIMIT),
+                activity: { state: "error", label: "Missing auth token", updatedAt: Date.now() },
+                lastError: "Missing auth token",
+              }
+            : t
+        )
+      );
+      return false;
+    }
+    if (!target.ws || target.ws.readyState !== WebSocket.OPEN) {
+      setTargets((prev) =>
+        prev.map((t) =>
+          t.id === id
+            ? {
+                ...t,
+                logs: [
+                  ...t.logs,
+                  { text: "Cannot send: not connected", type: "error" as LogType, timestamp: new Date() },
+                ].slice(-LOG_LIMIT),
+                activity: { state: "error", label: "Not connected", updatedAt: Date.now() },
+                lastError: "Not connected",
+              }
+            : t
+        )
+      );
+      return false;
+    }
+
+    const requestId = cmd ? createRequestId() : "";
+    const outbound = cmd ? attachRequestId(payload, requestId) : payload;
+    const raw = JSON.stringify(outbound);
+
+    const ok = safeSend(target.ws, raw);
+    if (!ok) {
+      setTargets((prev) =>
+        prev.map((t) =>
+          t.id === id
+            ? {
+                ...t,
+                logs: [
+                  ...t.logs,
+                  { text: "Send failed (socket not open)", type: "error" as LogType, timestamp: new Date() },
+                ].slice(-LOG_LIMIT),
+              }
+            : t
+        )
+      );
+      return false;
+    }
+
+    if (cmd && requestId) {
+      setPendingAction(id, cmd, requestId, label ?? cmd);
+    }
     setTargets((prev) =>
-      prev.map((t) => {
-        if (t.id !== id) return t;
-        if (locked) {
-            return {
+      prev.map((t) =>
+        t.id === id
+          ? {
               ...t,
               logs: [
                 ...t.logs,
-                { text: "Session locked. Please sign in again to run actions.", type: "error" as LogType, timestamp: new Date() },
+                { text: label ? `$ ${label}  ${raw}` : `$ ${raw}`, type: "command" as LogType, timestamp: new Date() },
               ].slice(-LOG_LIMIT),
-              activity: { state: "error", label: "Session locked", updatedAt: Date.now() },
-              lastError: "Session locked",
-            };
-        }
-        if (!token) {
-          return {
-            ...t,
-            logs: [
-              ...t.logs,
-              { text: "Missing auth token. Please login again.", type: "error" as LogType, timestamp: new Date() },
-            ].slice(-LOG_LIMIT),
-            activity: { state: "error", label: "Missing auth token", updatedAt: Date.now() },
-            lastError: "Missing auth token",
-          };
-        }
-        if (!t.ws || t.ws.readyState !== WebSocket.OPEN) {
-          return {
-            ...t,
-            logs: [
-              ...t.logs,
-              { text: "Cannot send: not connected", type: "error" as LogType, timestamp: new Date() },
-            ].slice(-LOG_LIMIT),
-            activity: { state: "error", label: "Not connected", updatedAt: Date.now() },
-            lastError: "Not connected",
-          };
-        }
-        const raw = JSON.stringify(payload);
-
-        // [PATCH] send an toàn
-        const ok = safeSend(t.ws, raw);
-        if (!ok) {
-          return {
-            ...t,
-            logs: [
-              ...t.logs,
-              { text: "Send failed (socket not open)", type: "error" as LogType, timestamp: new Date() },
-            ].slice(-LOG_LIMIT),
-          };
-        }
-
-        return {
-          ...t,
-          logs: [
-            ...t.logs,
-            { text: label ? `$ ${label}  ${raw}` : `$ ${raw}`, type: "command" as LogType, timestamp: new Date() },
-          ].slice(-LOG_LIMIT),
-        };
-      })
+            }
+          : t
+      )
     );
+    return true;
   };
 
   const sendJson = (payload: unknown, label?: string, options?: { markRunning?: boolean }) => {
@@ -870,17 +1016,21 @@ export default function App() {
       targetIds.push(active.id);
     }
 
-    if (options?.markRunning) {
-      targetIds.forEach((id) => markRunning(id, label || "Working"));
-    }
+    const sentIds: string[] = [];
 
     if (broadcastMode) {
-      targetIds.forEach((id) =>
-        sendJsonToTarget(id, payload, label ? `BROADCAST:${label}` : "BROADCAST")
-      );
-      return;
+      targetIds.forEach((id) => {
+        const sent = sendJsonToTarget(id, payload, label ? `BROADCAST:${label}` : "BROADCAST");
+        if (sent) sentIds.push(id);
+      });
+    } else if (active) {
+      const sent = sendJsonToTarget(active.id, payload, label);
+      if (sent) sentIds.push(active.id);
     }
-    if (active) sendJsonToTarget(active.id, payload, label);
+
+    if (options?.markRunning) {
+      sentIds.forEach((id) => markRunning(id, label || "Working"));
+    }
   };
 
   const actionPing = () => sendJson({ cmd: "ping" }, "ping", { markRunning: true });
@@ -896,14 +1046,19 @@ export default function App() {
   const actionScreenStream = () => {
     const dur = Math.max(1, Math.min(60, streamDuration));
     const fps = Math.max(1, Math.min(30, streamFps));
-    sendJson({ cmd: "screen_stream", duration: dur, fps }, "screen_stream", { markRunning: true });
-    if (!broadcastMode && active) {
-      setTargets((prev) =>
-        prev.map((t) =>
-          t.id === active.id ? { ...t, stream: { ...t.stream, running: true, duration: dur, fps } } : t
-        )
-      );
+    if (broadcastMode) {
+      sendJson({ cmd: "screen_stream", duration: dur, fps }, "screen_stream", { markRunning: true });
+      return;
     }
+    if (!active) return;
+    const sent = sendJsonToTarget(active.id, { cmd: "screen_stream", duration: dur, fps }, "screen_stream");
+    if (!sent) return;
+    markRunning(active.id, "screen_stream");
+    setTargets((prev) =>
+      prev.map((t) =>
+        t.id === active.id ? { ...t, stream: { ...t.stream, running: true, duration: dur, fps } } : t
+      )
+    );
   };
 
   const actionKillProcess = (pid: number) =>
@@ -961,6 +1116,7 @@ export default function App() {
     }
     if (t?.lastVideo?.url) URL.revokeObjectURL(t.lastVideo.url);
     clearActivityTimer(id);
+    clearAllPending(id);
 
     setTargets((prev) => prev.filter((x) => x.id !== id));
     setSelectedForBroadcast((prev) => prev.filter((x) => x !== id));
@@ -1531,20 +1687,20 @@ export default function App() {
                         <>
                           <button
                             onClick={actionScreen}
-                            disabled={actionsDisabled}
+                            disabled={actionsDisabled || isPendingForActive("screen")}
                             className={`inline-flex items-center gap-2 px-3 py-2 rounded-lg
                                       bg-slate-900/60 border border-border transition text-sm
-                                      ${actionsDisabled ? "opacity-50 cursor-not-allowed" : "hover:bg-slate-800"}`}
+                                      ${actionsDisabled || isPendingForActive("screen") ? "opacity-50 cursor-not-allowed" : "hover:bg-slate-800"}`}
                           >
                             <Monitor className="w-4 h-4" /> Screen
                           </button>
 
                           <button
                             onClick={actionCamera}
-                            disabled={actionsDisabled}
+                            disabled={actionsDisabled || isPendingForActive("camera")}
                             className={`inline-flex items-center gap-2 px-3 py-2 rounded-lg
                                       bg-slate-900/60 border border-border transition text-sm
-                                      ${actionsDisabled ? "opacity-50 cursor-not-allowed" : "hover:bg-slate-800"}`}
+                                      ${actionsDisabled || isPendingForActive("camera") ? "opacity-50 cursor-not-allowed" : "hover:bg-slate-800"}`}
                           >
                             <Camera className="w-4 h-4" /> Camera
                           </button>
@@ -1562,10 +1718,10 @@ export default function App() {
                             />
                             <button
                               onClick={actionCameraVideo}
-                              disabled={actionsDisabled}
+                              disabled={actionsDisabled || isPendingForActive("camera_video")}
                               className={`inline-flex items-center gap-2 px-2 py-1 rounded-md
                                         bg-primary/20 transition text-sm
-                                        ${actionsDisabled ? "opacity-50 cursor-not-allowed" : "hover:bg-primary/30"}`}
+                                        ${actionsDisabled || isPendingForActive("camera_video") ? "opacity-50 cursor-not-allowed" : "hover:bg-primary/30"}`}
                             >
                               <Video className="w-4 h-4" /> Record
                             </button>
@@ -1594,10 +1750,10 @@ export default function App() {
                             />
                             <button
                               onClick={actionScreenStream}
-                              disabled={actionsDisabled}
+                              disabled={actionsDisabled || isPendingForActive("screen_stream") || active.stream.running}
                               className={`inline-flex items-center gap-2 px-2 py-1 rounded-md
                                         bg-primary/20 transition text-sm
-                                        ${actionsDisabled ? "opacity-50 cursor-not-allowed" : "hover:bg-primary/30"}`}
+                                        ${actionsDisabled || isPendingForActive("screen_stream") || active.stream.running ? "opacity-50 cursor-not-allowed" : "hover:bg-primary/30"}`}
                             >
                               <Send className="w-4 h-4" /> Stream
                             </button>
@@ -1610,9 +1766,9 @@ export default function App() {
                         <>
                           <button
                             onClick={actionListProcesses}
-                            disabled={actionsDisabled}
+                            disabled={actionsDisabled || isPendingForActive("process_list")}
                             className={`inline-flex items-center gap-2 px-3 py-2 rounded-lg bg-slate-900/60 border border-border transition text-sm ${
-                              actionsDisabled ? "opacity-50 cursor-not-allowed" : "hover:bg-slate-800"
+                              actionsDisabled || isPendingForActive("process_list") ? "opacity-50 cursor-not-allowed" : "hover:bg-slate-800"
                             }`}
                           >
                             <RefreshCw className="w-4 h-4" /> Processes
@@ -1625,9 +1781,9 @@ export default function App() {
                         <>
                           <button
                             onClick={actionPing}
-                            disabled={actionsDisabled}
+                            disabled={actionsDisabled || isPendingForActive("ping")}
                             className={`inline-flex items-center gap-2 px-3 py-2 rounded-lg bg-slate-900/60 border border-border transition text-sm ${
-                              actionsDisabled ? "opacity-50 cursor-not-allowed" : "hover:bg-slate-800"
+                              actionsDisabled || isPendingForActive("ping") ? "opacity-50 cursor-not-allowed" : "hover:bg-slate-800"
                             }`}
                           >
                             <Activity className="w-4 h-4" /> Ping
@@ -1650,9 +1806,9 @@ export default function App() {
                         />
                         <button
                           onClick={actionStartProcess}
-                          disabled={actionsDisabled}
+                          disabled={actionsDisabled || isPendingForActive("process_start")}
                           className={`inline-flex items-center gap-2 px-2 py-1 rounded-md bg-primary/20 transition text-sm ${
-                            actionsDisabled ? "opacity-50 cursor-not-allowed" : "hover:bg-primary/30"
+                            actionsDisabled || isPendingForActive("process_start") ? "opacity-50 cursor-not-allowed" : "hover:bg-primary/30"
                           }`}
                         >
                           <Send className="w-4 h-4" /> Start
