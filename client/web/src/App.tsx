@@ -1,19 +1,23 @@
 import Header from "./components/Header";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { KeyboardEvent as ReactKeyboardEvent } from "react";
 import {
   Activity,
+  Bell,
   Camera,
   Check,
   ChevronDown,
   Cpu,
   Download,
   Film,
+  Keyboard,
   Image as ImageIcon,
   Loader2,
   Lock,
   Monitor,
   Plus,
   Power,
+  PowerOff,
   RadioTower,
   RefreshCw,
   Search,
@@ -26,8 +30,8 @@ import {
 } from "lucide-react";
 import LoginPage from "./LoginPage";
 import { useAuth } from "./auth";
-import { logAudit, discoverDevices, ApiError } from "./api";
-import type { AuthUser, DiscoveryDevice } from "./types";
+import { ApiError, discoverDevices, getControllerStatus, logAudit, restartController, stopController } from "./api";
+import type { AuthUser, ControllerStatus, DiscoveryDevice, HotkeyAction, HotkeyMap } from "./types";
 
 // [ADDED] App name (để LoginPage / Header dùng thống nhất)
 const APP_NAME = import.meta.env.VITE_APP_NAME || "Remote Desktop Control"; // [ADDED]
@@ -79,6 +83,17 @@ interface StreamState {
   lastSeq: number;
 }
 
+interface TargetActivity {
+  state: "idle" | "running" | "error";
+  label: string;
+  updatedAt: number;
+}
+
+interface ToastPayload {
+  text: string;
+  tone: "info" | "success" | "error";
+}
+
 interface RemoteTarget {
   id: string;
   name: string;
@@ -95,9 +110,20 @@ interface RemoteTarget {
   lastImage?: LastImage;
   lastVideo?: LastVideo;
   stream: StreamState;
+  activity: TargetActivity;
+  lastError?: string | null;
 }
 
 const DEFAULT_PORT = 9002;
+const DISCOVERY_PORT = Number(import.meta.env.VITE_DISCOVERY_PORT || 41000);
+const HOTKEY_STORAGE_KEY = "rdc.hotkeys";
+const HOTKEY_ENABLED_KEY = "rdc.hotkeys.enabled";
+const DEFAULT_HOTKEYS: HotkeyMap = {
+  connect: "ctrl+k",
+  reset: "ctrl+shift+x",
+  stream: "ctrl+shift+s",
+  processes: "ctrl+shift+p",
+};
 const createId = () => `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
 function formatTime(date: Date) {
@@ -164,6 +190,48 @@ function safeSend(ws: WebSocket | undefined, raw: string) {
 // [PATCH] giới hạn log để tránh lag/memory leak
 const LOG_LIMIT = 400;
 
+function normalizeHotkey(combo: string) {
+  return combo
+    .trim()
+    .toLowerCase()
+    .replace("meta", "ctrl");
+}
+
+function formatEventHotkey(e: KeyboardEvent | ReactKeyboardEvent): string | null {
+  const parts: string[] = [];
+  if (e.ctrlKey || e.metaKey) parts.push("ctrl");
+  if (e.shiftKey) parts.push("shift");
+  if (e.altKey) parts.push("alt");
+  const key = e.key?.toLowerCase();
+  if (!key || key === "control" || key === "shift" || key === "alt" || key === "meta") return null;
+  parts.push(key.length === 1 ? key : key.replace("arrow", "arrow "));
+  return normalizeHotkey(parts.join("+"));
+}
+
+function prettyHotkey(combo: string) {
+  return combo
+    .split("+")
+    .map((part) => part.length === 1 ? part.toUpperCase() : part[0].toUpperCase() + part.slice(1))
+    .join(" + ");
+}
+
+function loadHotkeys(): HotkeyMap {
+  try {
+    const raw = localStorage.getItem(HOTKEY_STORAGE_KEY);
+    if (!raw) return DEFAULT_HOTKEYS;
+    const parsed = JSON.parse(raw) as HotkeyMap;
+    return { ...DEFAULT_HOTKEYS, ...parsed };
+  } catch {
+    return DEFAULT_HOTKEYS;
+  }
+}
+
+const isFormElement = (target: EventTarget | null) => {
+  if (!target || !(target as HTMLElement).tagName) return false;
+  const tag = (target as HTMLElement).tagName.toLowerCase();
+  return tag === "input" || tag === "textarea" || tag === "select";
+};
+
 export default function App() {
   const { user, token, locked, lockedReason, lockSession } = useAuth();
   const [targets, setTargets] = useState<RemoteTarget[]>([]);
@@ -186,15 +254,20 @@ export default function App() {
   const [streamFps, setStreamFps] = useState(5);
 
   const logsEndRef = useRef<HTMLDivElement | null>(null);
+  const activityTimers = useRef<Record<string, ReturnType<typeof setTimeout> | undefined>>({});
+  const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const hotkeyHandlerRef = useRef<(action: HotkeyAction) => void>(() => {});
   const [discovering, setDiscovering] = useState(false);
   const [discoveredDevices, setDiscoveredDevices] = useState<DiscoveryDevice[]>([]);
   const [discoverError, setDiscoverError] = useState<string | null>(null);
   const [powerMenuOpen, setPowerMenuOpen] = useState(false);
-  const [confirmAction, setConfirmAction] = useState<{
-    action: "restart" | "shutdown" | "reset" | null;
-    code: string;
-  }>({ action: null, code: "" });
-  const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const [pendingControllerAction, setPendingControllerAction] = useState<"restart" | "stop" | null>(null);
+  const [toast, setToast] = useState<ToastPayload | null>(null);
+  const [controllerStatus, setControllerStatus] = useState<ControllerStatus | null>(null);
+  const [controllerBusy, setControllerBusy] = useState(false);
+  const [hotkeysEnabled, setHotkeysEnabled] = useState<boolean>(() => localStorage.getItem(HOTKEY_ENABLED_KEY) === "true");
+  const [hotkeys, setHotkeys] = useState<HotkeyMap>(() => loadHotkeys());
+  const [hotkeyConflicts, setHotkeyConflicts] = useState<Record<string, string>>({});
 
   const active = useMemo(
     () => targets.find((t) => t.id === activeId) ?? targets[0] ?? null,
@@ -209,7 +282,15 @@ export default function App() {
     setStreamFps(active.stream.fps);
   }, [active?.id]);
 
-  const canSend = !!active?.connected && !!token && !locked;
+  const selectedTargets = broadcastMode
+    ? targets.filter((t) => selectedForBroadcast.includes(t.id))
+    : active
+    ? [active]
+    : [];
+  const anyConnected = selectedTargets.some((t) => t.connected);
+  const anyBusy = selectedTargets.some((t) => t.activity.state === "running");
+  const canSend = selectedTargets.length > 0 && anyConnected && !!token && !locked;
+  const actionsDisabled = !canSend || anyBusy;
 
   useEffect(() => {
     if (!activeId && targets.length > 0) setActiveId(targets[0].id);
@@ -218,6 +299,20 @@ export default function App() {
   useEffect(() => {
     logsEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [targets, activeId]);
+
+  const fetchControllerStatus = useCallback(async () => {
+    if (!token) return;
+    try {
+      const res = await getControllerStatus(token);
+      if (res.ok) setControllerStatus(res.status);
+    } catch (err) {
+      console.warn("Controller status check failed", err);
+    }
+  }, [token]);
+
+  useEffect(() => {
+    fetchControllerStatus();
+  }, [fetchControllerStatus]);
 
   // [PATCH] cleanup khi unmount: close WS + revoke blob URLs
   useEffect(() => {
@@ -233,6 +328,10 @@ export default function App() {
             if (t.lastVideo?.url) URL.revokeObjectURL(t.lastVideo.url);
           } catch {}
         });
+        Object.values(activityTimers.current).forEach((timer) => {
+          if (timer) clearTimeout(timer);
+        });
+        if (toastTimer.current) clearTimeout(toastTimer.current);
       } catch {}
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -248,7 +347,50 @@ export default function App() {
               logs: [...t.logs, { text, type, timestamp: new Date() }].slice(-LOG_LIMIT),
             }
           : t
+          )
+    );
+  };
+
+  const clearActivityTimer = (id: string) => {
+    const timer = activityTimers.current[id];
+    if (timer) {
+      clearTimeout(timer);
+    }
+    activityTimers.current[id] = undefined;
+  };
+
+  const setActivity = (id: string, activity: TargetActivity) => {
+    setTargets((prev) =>
+      prev.map((t) =>
+        t.id === id
+          ? {
+              ...t,
+              activity: { ...activity, updatedAt: Date.now() },
+            }
+          : t
       )
+    );
+  };
+
+  const markRunning = (id: string, label: string) => {
+    clearActivityTimer(id);
+    setActivity(id, { state: "running", label, updatedAt: Date.now() });
+    activityTimers.current[id] = setTimeout(() => {
+      setActivity(id, { state: "idle", label: "Ready", updatedAt: Date.now() });
+      activityTimers.current[id] = undefined;
+    }, 4200);
+  };
+
+  const markIdle = (id: string, label = "Ready") => {
+    clearActivityTimer(id);
+    setActivity(id, { state: "idle", label, updatedAt: Date.now() });
+  };
+
+  const markError = (id: string, label: string) => {
+    clearActivityTimer(id);
+    setActivity(id, { state: "error", label, updatedAt: Date.now() });
+    setTargets((prev) =>
+      prev.map((t) => (t.id === id ? { ...t, lastError: label } : t))
     );
   };
 
@@ -258,10 +400,45 @@ export default function App() {
     );
   };
 
-  const showToast = (msg: string) => {
-    setToastMessage(msg);
-    setTimeout(() => setToastMessage(null), 2800);
+  const showToast = (payload: ToastPayload) => {
+    if (toastTimer.current) clearTimeout(toastTimer.current);
+    setToast(payload);
+    toastTimer.current = setTimeout(() => setToast(null), 3000);
   };
+
+  const updateHotkey = (action: HotkeyAction, combo: string | null) => {
+    setHotkeys((prev) => {
+      const next = { ...prev, [action]: combo ? normalizeHotkey(combo) : "" };
+      localStorage.setItem(HOTKEY_STORAGE_KEY, JSON.stringify(next));
+      return next;
+    });
+  };
+
+  const resetHotkeys = () => {
+    setHotkeys(DEFAULT_HOTKEYS);
+    localStorage.setItem(HOTKEY_STORAGE_KEY, JSON.stringify(DEFAULT_HOTKEYS));
+  };
+
+  useEffect(() => {
+    const used = new Map<string, string>();
+    const conflicts: Record<string, string> = {};
+    (Object.entries(hotkeys) as [string, string][]).forEach(([actionKey, combo]) => {
+      if (!combo) return;
+      const normalized = normalizeHotkey(combo);
+      if (used.has(normalized)) {
+        const other = used.get(normalized)!;
+        conflicts[actionKey] = other;
+        conflicts[other] = actionKey;
+      } else {
+        used.set(normalized, actionKey);
+      }
+    });
+    setHotkeyConflicts(conflicts);
+  }, [hotkeys]);
+
+  useEffect(() => {
+    localStorage.setItem(HOTKEY_ENABLED_KEY, hotkeysEnabled ? "true" : "false");
+  }, [hotkeysEnabled]);
 
   const recordAudit = async (action: string, meta: Record<string, unknown> = {}) => {
     if (!token) return;
@@ -269,6 +446,40 @@ export default function App() {
       await logAudit(token, action, meta);
     } catch (err) {
       console.warn("Failed to log audit", err);
+    }
+  };
+
+  const handleControllerRestart = async () => {
+    if (!token) return;
+    setControllerBusy(true);
+    try {
+      const res = await restartController(token);
+      setControllerStatus(res.status);
+      showToast({ text: "Controller restarting...", tone: "info" });
+      await recordAudit("controller_restart", {});
+    } catch (err) {
+      const message = err instanceof ApiError ? err.message : "Restart failed";
+      showToast({ text: message, tone: "error" });
+    } finally {
+      setControllerBusy(false);
+      setPendingControllerAction(null);
+    }
+  };
+
+  const handleControllerStop = async () => {
+    if (!token) return;
+    setControllerBusy(true);
+    try {
+      const res = await stopController(token);
+      setControllerStatus(res.status);
+      showToast({ text: "Controller stopped", tone: "success" });
+      await recordAudit("controller_stop", {});
+    } catch (err) {
+      const message = err instanceof ApiError ? err.message : "Stop failed";
+      showToast({ text: message, tone: "error" });
+    } finally {
+      setControllerBusy(false);
+      setPendingControllerAction(null);
     }
   };
 
@@ -291,6 +502,8 @@ export default function App() {
       authStatus: "idle",
       authUser: null,
       stream: { running: false, fps: 5, duration: 5, lastSeq: -1 },
+      activity: { state: "idle", label: "Disconnected", updatedAt: Date.now() },
+      lastError: null,
     };
 
     setTargets((prev) => [...prev, t]);
@@ -306,7 +519,33 @@ export default function App() {
     setNewHost(host);
     setNewPort(String(device.wsPort || DEFAULT_PORT));
     setNewName(device.name || host);
-    showToast("Device info loaded. Click Add to connect.");
+    showToast({ text: "Device info loaded. Click Add or Connect.", tone: "success" });
+  };
+
+  const handleConnectDiscovered = (device: DiscoveryDevice) => {
+    const host = device.ip || "";
+    if (!host) return;
+    const port = device.wsPort ?? DEFAULT_PORT;
+    const id = createId();
+    const target: RemoteTarget = {
+      id,
+      name: device.name || host,
+      host,
+      port,
+      connected: false,
+      connecting: false,
+      logs: [{ text: "Pending discovery connect", type: "info", timestamp: new Date() }],
+      processes: [],
+      authStatus: "idle",
+      authUser: null,
+      stream: { running: false, fps: 5, duration: 5, lastSeq: -1 },
+      activity: { state: "running", label: "Connecting", updatedAt: Date.now() },
+      lastError: null,
+    };
+    setTargets((prev) => [...prev, target]);
+    setActiveId(id);
+    setTimeout(() => connectTarget(id), 80);
+    showToast({ text: `Connecting to ${host}`, tone: "info" });
   };
 
   const handleDiscoverDevices = async () => {
@@ -314,12 +553,17 @@ export default function App() {
     setDiscovering(true);
     setDiscoverError(null);
     try {
-      const res = await discoverDevices(token);
-      const list = res.devices || [];
-      setDiscoveredDevices(list as DiscoveryDevice[]);
+      const res = await discoverDevices(token, { retries: 2 });
+      const list = (res.devices || []).map((d) => ({
+        ...d,
+        lastSeenMs: d.lastSeenMs ?? Date.now(),
+      })) as DiscoveryDevice[];
+      setDiscoveredDevices(list);
       await recordAudit("discover_devices", { found: list.length });
       if (!list.length) {
-        setDiscoverError("No agents responded to discovery broadcast. Ensure UDP port 41000 is open.");
+        setDiscoverError(`No agents responded on UDP ${DISCOVERY_PORT}. Ensure discovery is allowed on your LAN.`);
+      } else {
+        showToast({ text: `Found ${list.length} device(s)`, tone: "success" });
       }
     } catch (err) {
       const msg = err instanceof ApiError ? err.message : "Discovery failed";
@@ -345,6 +589,8 @@ export default function App() {
           connecting: false,
           ws: undefined,
           lastVideo: t.lastVideo ? { ...t.lastVideo, url: undefined } : undefined,
+          activity: { state: "idle", label: "Disconnected", updatedAt: Date.now() },
+          lastError: null,
         };
       })
     );
@@ -371,6 +617,7 @@ export default function App() {
                 : x
             )
           );
+          markIdle(id, "Connected");
           if (token) {
             safeSend(ws, JSON.stringify({ cmd: "auth", token }));
           }
@@ -380,6 +627,7 @@ export default function App() {
 
         ws.onerror = () => {
           addLog(id, "WebSocket error (network / server down?)", "error");
+          markError(id, "Connection error");
           // [PATCH] nếu lỗi sớm, thường sẽ onclose; nhưng nếu không, vẫn hạ connecting
           setTargets((inner) =>
             inner.map((x) => (x.id === id ? { ...x, connecting: false } : x))
@@ -401,6 +649,7 @@ export default function App() {
                 stream: { ...x.stream, running: false },
                 authStatus: "idle",
                 authUser: null,
+                activity: { state: "idle", label: "Disconnected", updatedAt: Date.now() },
               };
             })
           );
@@ -430,11 +679,16 @@ export default function App() {
               status === "ok" ? `Session authenticated as ${info?.username}` : `Auth failed: ${data.message || "invalid"}`,
               status === "ok" ? "success" : "error"
             );
+            if (status === "ok") {
+              markIdle(id, "Authenticated");
+            } else {
+              markError(id, "Auth failed");
+            }
             return;
           }
 
           // screen_stream frames
-          if (data.cmd === "screen_stream" && typeof data.image_base64 === "string") {
+        if (data.cmd === "screen_stream" && typeof data.image_base64 === "string") {
             const seq = typeof data.seq === "number" ? data.seq : undefined;
             setTargets((inner) =>
               inner.map((x) =>
@@ -447,6 +701,7 @@ export default function App() {
                   : x
               )
             );
+            markRunning(id, "Streaming");
             return;
           }
 
@@ -471,6 +726,7 @@ export default function App() {
             );
 
             addLog(id, `Received image (${kind})`, "success");
+            markIdle(id, "Image received");
             return;
           }
 
@@ -490,6 +746,7 @@ export default function App() {
             );
 
             addLog(id, `Received camera video (${format})`, "success");
+            markIdle(id, "Video ready");
             return;
           }
 
@@ -509,6 +766,7 @@ export default function App() {
 
             setTargets((inner) => inner.map((x) => (x.id === id ? { ...x, processes: procs } : x)));
             addLog(id, `Loaded ${procs.length} processes`, "success");
+            markIdle(id, "Processes updated");
             return;
           }
 
@@ -517,6 +775,11 @@ export default function App() {
             const status = data.status as string;
             const msg = typeof data.message === "string" ? data.message : JSON.stringify(data);
             addLog(id, `${status.toUpperCase()}: ${msg}`, status === "ok" ? "success" : "error");
+            if (status === "ok") {
+              markIdle(id, "Completed");
+            } else {
+              markError(id, msg);
+            }
             return;
           }
 
@@ -529,6 +792,8 @@ export default function App() {
           connecting: true,
           // [PATCH] append log ngay trong cùng lần setTargets, không gọi addLog lồng
           logs: [...t.logs, connectingLog].slice(-LOG_LIMIT),
+          activity: { state: "running", label: "Connecting", updatedAt: Date.now() },
+          lastError: null,
         };
       })
     );
@@ -545,6 +810,8 @@ export default function App() {
                 ...t.logs,
                 { text: "Session locked. Please sign in again to run actions.", type: "error" as LogType, timestamp: new Date() },
               ].slice(-LOG_LIMIT),
+              activity: { state: "error", label: "Session locked", updatedAt: Date.now() },
+              lastError: "Session locked",
             };
         }
         if (!token) {
@@ -554,6 +821,8 @@ export default function App() {
               ...t.logs,
               { text: "Missing auth token. Please login again.", type: "error" as LogType, timestamp: new Date() },
             ].slice(-LOG_LIMIT),
+            activity: { state: "error", label: "Missing auth token", updatedAt: Date.now() },
+            lastError: "Missing auth token",
           };
         }
         if (!t.ws || t.ws.readyState !== WebSocket.OPEN) {
@@ -563,6 +832,8 @@ export default function App() {
               ...t.logs,
               { text: "Cannot send: not connected", type: "error" as LogType, timestamp: new Date() },
             ].slice(-LOG_LIMIT),
+            activity: { state: "error", label: "Not connected", updatedAt: Date.now() },
+            lastError: "Not connected",
           };
         }
         const raw = JSON.stringify(payload);
@@ -590,10 +861,21 @@ export default function App() {
     );
   };
 
-  const sendJson = (payload: unknown, label?: string) => {
+  const sendJson = (payload: unknown, label?: string, options?: { markRunning?: boolean }) => {
+    const targetIds: string[] = [];
     if (broadcastMode) {
       if (selectedForBroadcast.length === 0) return;
-      selectedForBroadcast.forEach((id) =>
+      targetIds.push(...selectedForBroadcast);
+    } else if (active) {
+      targetIds.push(active.id);
+    }
+
+    if (options?.markRunning) {
+      targetIds.forEach((id) => markRunning(id, label || "Working"));
+    }
+
+    if (broadcastMode) {
+      targetIds.forEach((id) =>
         sendJsonToTarget(id, payload, label ? `BROADCAST:${label}` : "BROADCAST")
       );
       return;
@@ -601,16 +883,20 @@ export default function App() {
     if (active) sendJsonToTarget(active.id, payload, label);
   };
 
-  const actionPing = () => sendJson({ cmd: "ping" }, "ping");
-  const actionListProcesses = () => sendJson({ cmd: "process_list" }, "process_list");
-  const actionScreen = () => sendJson({ cmd: "screen" }, "screen");
-  const actionCamera = () => sendJson({ cmd: "camera" }, "camera");
+  const actionPing = () => sendJson({ cmd: "ping" }, "ping", { markRunning: true });
+  const actionListProcesses = () => sendJson({ cmd: "process_list" }, "process_list", { markRunning: true });
+  const actionScreen = () => sendJson({ cmd: "screen" }, "screen", { markRunning: true });
+  const actionCamera = () => sendJson({ cmd: "camera" }, "camera", { markRunning: true });
   const actionCameraVideo = () =>
-    sendJson({ cmd: "camera_video", duration: Math.max(1, Math.min(30, videoDuration)) }, "camera_video");
+    sendJson(
+      { cmd: "camera_video", duration: Math.max(1, Math.min(30, videoDuration)) },
+      "camera_video",
+      { markRunning: true }
+    );
   const actionScreenStream = () => {
     const dur = Math.max(1, Math.min(60, streamDuration));
     const fps = Math.max(1, Math.min(30, streamFps));
-    sendJson({ cmd: "screen_stream", duration: dur, fps }, "screen_stream");
+    sendJson({ cmd: "screen_stream", duration: dur, fps }, "screen_stream", { markRunning: true });
     if (!broadcastMode && active) {
       setTargets((prev) =>
         prev.map((t) =>
@@ -620,45 +906,41 @@ export default function App() {
     }
   };
 
-  const actionKillProcess = (pid: number) => sendJson({ cmd: "process_kill", pid }, `process_kill:${pid}`);
+  const actionKillProcess = (pid: number) =>
+    sendJson({ cmd: "process_kill", pid }, `process_kill:${pid}`, { markRunning: true });
   const actionStartProcess = () => {
     const path = startPath.trim();
     if (!path) return;
-    sendJson({ cmd: "process_start", path }, "process_start");
+    sendJson({ cmd: "process_start", path }, "process_start", { markRunning: true });
     setStartPath("");
   };
 
   const handleResetTasks = () => {
     sendJson({ cmd: "cancel_all" }, "cancel_all");
-    setTargets((prev) => prev.map((t) => ({ ...t, stream: { ...t.stream, running: false } })));
-    showToast("Reset done");
+    setTargets((prev) =>
+      prev.map((t) => ({
+        ...t,
+        stream: { ...t.stream, running: false },
+        activity: { state: "idle", label: "Idle after reset", updatedAt: Date.now() },
+        lastError: null,
+      }))
+    );
+    showToast({ text: "Reset done", tone: "success" });
     recordAudit("reset", { target: active?.host ?? "broadcast" });
   };
 
-  const requestPowerAction = (action: "restart" | "shutdown" | "reset") => {
-    if (action === "reset") {
-      handleResetTasks();
-      return;
-    }
-    setConfirmAction({ action, code: "" });
+  const requestControllerAction = (action: "restart" | "stop") => {
+    setPendingControllerAction(action);
     setPowerMenuOpen(false);
   };
 
-  const confirmPowerAction = () => {
-    if (!confirmAction.action) return;
-    const keyword = confirmAction.action === "restart" ? "RESTART" : "SHUTDOWN";
-    if (confirmAction.code.toUpperCase() !== keyword) {
-      showToast(`Type ${keyword} to confirm.`);
-      return;
+  const confirmControllerAction = () => {
+    if (!pendingControllerAction) return;
+    if (pendingControllerAction === "restart") {
+      void handleControllerRestart();
+    } else {
+      void handleControllerStop();
     }
-    if (user?.role !== "admin") {
-      showToast("Administrator role required.");
-      setConfirmAction({ action: null, code: "" });
-      return;
-    }
-    sendJson({ cmd: confirmAction.action, token }, confirmAction.action);
-    recordAudit(confirmAction.action, { target: active?.host ?? "broadcast" });
-    setConfirmAction({ action: null, code: "" });
   };
 
   const actionSendCustomJson = () => {
@@ -678,10 +960,95 @@ export default function App() {
       } catch {}
     }
     if (t?.lastVideo?.url) URL.revokeObjectURL(t.lastVideo.url);
+    clearActivityTimer(id);
 
     setTargets((prev) => prev.filter((x) => x.id !== id));
     setSelectedForBroadcast((prev) => prev.filter((x) => x !== id));
     if (activeId === id) setActiveId(null);
+  };
+
+  useEffect(() => {
+    hotkeyHandlerRef.current = (actionKey: HotkeyAction) => {
+      if (actionKey === "connect") {
+        if (active) {
+          connectTarget(active.id);
+        } else {
+          showToast({ text: "No target selected", tone: "error" });
+        }
+        return;
+      }
+      if (actionKey === "reset") {
+        handleResetTasks();
+        return;
+      }
+      if (!canSend) {
+        showToast({ text: "Connect to a target first", tone: "error" });
+        return;
+      }
+      if (actionsDisabled) {
+        showToast({ text: "Target is busy, wait for it to finish.", tone: "error" });
+        return;
+      }
+      if (actionKey === "stream") {
+        actionScreenStream();
+      } else if (actionKey === "processes") {
+        actionListProcesses();
+      }
+    };
+  });
+
+  useEffect(() => {
+    if (!hotkeysEnabled) return;
+    const handler = (e: KeyboardEvent) => {
+      if (isFormElement(e.target)) return;
+      if (e.repeat) return;
+      const combo = formatEventHotkey(e);
+      if (!combo) return;
+      const match = (Object.entries(hotkeys) as [HotkeyAction, string][]).find(
+        ([, hk]) => hk && normalizeHotkey(hk) === combo
+      );
+      if (!match) return;
+      e.preventDefault();
+      hotkeyHandlerRef.current(match[0]);
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [hotkeysEnabled, hotkeys]);
+
+  const HotkeyRow = ({ action, label }: { action: HotkeyAction; label: string }) => {
+    const conflictWith = hotkeyConflicts[action];
+    const value = hotkeys[action] ?? "";
+    return (
+      <div className="space-y-1">
+        <div className="flex items-center justify-between gap-2">
+          <span className="text-xs font-medium text-slate-100">{label}</span>
+          {conflictWith ? (
+            <span className="text-[11px] text-amber-300">Conflicts with {conflictWith}</span>
+          ) : null}
+        </div>
+        <div className="flex items-center gap-2">
+          <input
+            aria-label={`${label} hotkey`}
+            value={value ? prettyHotkey(value) : ""}
+            placeholder="Press keys"
+            readOnly
+            onKeyDown={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              const combo = formatEventHotkey(e);
+              if (combo) updateHotkey(action, combo);
+            }}
+            className="flex-1 px-3 py-2 rounded-lg bg-slate-900/60 border border-border text-sm focus:outline-none focus:ring-2 focus:ring-primary/60"
+          />
+          <button
+            onClick={() => updateHotkey(action, null)}
+            className="px-2 py-1 text-[11px] rounded-lg border border-border bg-slate-900/60 hover:bg-slate-800"
+          >
+            Clear
+          </button>
+        </div>
+      </div>
+    );
   };
 
   if (!token || !user || locked) {
@@ -699,7 +1066,7 @@ export default function App() {
         <Header title="Remote Control Center" connectedCount={targets.filter((t) => t.connected).length} />
 
         <div className="bg-secondary/40 border border-border rounded-2xl px-4 py-3 shadow-lg flex flex-wrap items-center gap-3 justify-between">
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-3 flex-wrap">
             <div className="inline-flex items-center gap-2 rounded-full border border-border bg-slate-900/50 px-3 py-1.5 text-xs">
               <Shield className="w-4 h-4 text-primary" />
               <span className="font-semibold text-slate-50">{user.username}</span>
@@ -707,12 +1074,40 @@ export default function App() {
                 {user.role}
               </span>
             </div>
-            <div className="inline-flex items-center gap-2 text-xs text-muted-foreground">
+            <div className="inline-flex items-center gap-2 text-xs text-muted-foreground rounded-full border border-border bg-slate-900/50 px-3 py-1.5">
               <Wifi className="w-4 h-4 text-emerald-300" /> {targets.filter((t) => t.connected).length} connected
+            </div>
+            <div
+              className={`inline-flex items-center gap-2 text-xs px-3 py-1.5 rounded-full border ${
+                anyBusy ? "border-amber-400/60 bg-amber-500/10 text-amber-100" : "border-border bg-slate-900/50 text-muted-foreground"
+              }`}
+            >
+              <Bell className="w-4 h-4" />
+              {anyBusy ? "Task running" : "Idle"}
+            </div>
+            <div
+              className={`inline-flex items-center gap-2 text-xs px-3 py-1.5 rounded-full border ${
+                controllerStatus?.status === "running"
+                  ? "border-emerald-400/50 bg-emerald-500/10 text-emerald-100"
+                  : controllerStatus?.status === "error"
+                  ? "border-rose-400/50 bg-rose-500/10 text-rose-100"
+                  : "border-border bg-slate-900/50 text-muted-foreground"
+              }`}
+            >
+              <PowerOff className="w-4 h-4" />
+              <span>Controller: {controllerStatus?.status ?? "idle"}</span>
+              {controllerStatus?.pid ? <span className="text-[10px] text-slate-300">PID {controllerStatus.pid}</span> : null}
             </div>
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 flex-wrap">
+            <button
+              onClick={handleResetTasks}
+              className="inline-flex items-center gap-2 px-3 py-2 rounded-lg bg-slate-900/60 border border-border text-sm hover:bg-slate-800 disabled:opacity-60"
+              disabled={selectedTargets.length === 0}
+            >
+              <RefreshCw className="w-4 h-4" /> Reset / Cancel All
+            </button>
             <button
               onClick={() => {
                 recordAudit("lock", { source: "ui" });
@@ -725,32 +1120,45 @@ export default function App() {
 
             <div className="relative">
               <button
-                onClick={() => setPowerMenuOpen((v) => !v)}
-                className="inline-flex items-center gap-2 px-3 py-2 rounded-lg bg-primary text-sm font-semibold text-slate-50 shadow-lg"
+                onClick={() => {
+                  setPowerMenuOpen((v) => !v);
+                  fetchControllerStatus();
+                }}
+                className="inline-flex items-center gap-2 px-3 py-2 rounded-lg bg-primary text-sm font-semibold text-slate-50 shadow-lg disabled:opacity-60"
+                disabled={controllerBusy}
               >
-                <Power className="w-4 h-4" /> Power <ChevronDown className="w-4 h-4" />
+                <Power className="w-4 h-4" /> Controller <ChevronDown className="w-4 h-4" />
               </button>
               {powerMenuOpen ? (
                 <div className="absolute right-0 mt-2 w-48 rounded-xl border border-border bg-slate-900/90 shadow-xl z-10">
                   <button
-                    onClick={() => requestPowerAction("restart")}
+                    onClick={() => {
+                      requestControllerAction("restart");
+                      setPowerMenuOpen(false);
+                    }}
                     className="w-full px-3 py-2 text-left text-sm hover:bg-slate-800 flex items-center gap-2 disabled:opacity-60"
-                    disabled={user.role !== "admin"}
+                    disabled={user.role !== "admin" || controllerBusy}
                   >
-                    <RefreshCw className="w-4 h-4" /> Restart (admin)
+                    <RefreshCw className="w-4 h-4" /> Restart controller
                   </button>
                   <button
-                    onClick={() => requestPowerAction("shutdown")}
+                    onClick={() => {
+                      requestControllerAction("stop");
+                      setPowerMenuOpen(false);
+                    }}
                     className="w-full px-3 py-2 text-left text-sm hover:bg-slate-800 flex items-center gap-2 disabled:opacity-60"
-                    disabled={user.role !== "admin"}
+                    disabled={user.role !== "admin" || controllerBusy}
                   >
-                    <Power className="w-4 h-4" /> Shutdown (admin)
+                    <PowerOff className="w-4 h-4" /> Stop controller
                   </button>
                   <button
-                    onClick={() => requestPowerAction("reset")}
+                    onClick={() => {
+                      fetchControllerStatus();
+                      setPowerMenuOpen(false);
+                    }}
                     className="w-full px-3 py-2 text-left text-sm hover:bg-slate-800 flex items-center gap-2"
                   >
-                    <RefreshCw className="w-4 h-4" /> Reset tasks
+                    <Search className="w-4 h-4" /> Refresh status
                   </button>
                 </div>
               ) : null}
@@ -808,7 +1216,7 @@ export default function App() {
                   className="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg bg-slate-900/70 border border-border text-xs hover:bg-slate-800 disabled:opacity-50"
                 >
                   {discovering ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
-                  Scan
+                  Discover on LAN
                 </button>
               </div>
               {discoverError ? <p className="text-[11px] text-amber-200">{discoverError}</p> : null}
@@ -824,20 +1232,31 @@ export default function App() {
                           <p className="text-[11px] text-muted-foreground truncate">
                             {d.ip}:{d.wsPort || DEFAULT_PORT} {d.version ? `· v${d.version}` : ""}
                           </p>
+                          <p className="text-[10px] text-slate-400 truncate">
+                            Last seen {d.lastSeenMs ? new Date(d.lastSeenMs).toLocaleTimeString() : "just now"}
+                          </p>
                         </div>
-                        <button
-                          onClick={() => handleAddDiscovered(d)}
-                          className="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-primary/20 text-[11px] hover:bg-primary/30"
-                        >
-                          Use
-                        </button>
+                        <div className="flex items-center gap-1 shrink-0">
+                          <button
+                            onClick={() => handleAddDiscovered(d)}
+                            className="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-primary/20 text-[11px] hover:bg-primary/30"
+                          >
+                            Use
+                          </button>
+                          <button
+                            onClick={() => handleConnectDiscovered(d)}
+                            className="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-emerald-600/20 text-[11px] hover:bg-emerald-500/30 border border-emerald-500/30"
+                          >
+                            Connect
+                          </button>
+                        </div>
                       </div>
                     </div>
                   ))
                 )}
               </div>
               <p className="text-[11px] text-muted-foreground">
-                Broadcasts on UDP 41000 only. No port scans performed.
+                Broadcasts on UDP {DISCOVERY_PORT}. No port scans performed.
               </p>
             </div>
 
@@ -869,6 +1288,46 @@ export default function App() {
                   Select targets below, then actions will be sent to all selected.
                 </p>
               )}
+            </div>
+
+            {/* Hotkeys */}
+            <div className="bg-secondary/50 border border-border rounded-2xl p-4 space-y-3 shadow-lg">
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <Keyboard className="w-4 h-4 text-primary" />
+                  <span className="text-sm font-medium">Hotkeys</span>
+                </div>
+                <button
+                  onClick={() => setHotkeysEnabled((v) => !v)}
+                  className={`relative inline-flex h-6 w-11 items-center rounded-full transition ${
+                    hotkeysEnabled ? "bg-primary" : "bg-slate-700"
+                  }`}
+                >
+                  <span
+                    className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                      hotkeysEnabled ? "translate-x-6" : "translate-x-1"
+                    }`}
+                  />
+                </button>
+              </div>
+              <p className="text-[11px] text-muted-foreground">
+                Hotkeys are captured only while the input is focused. Global hotkeys work when enabled and you are not typing
+                in a field.
+              </p>
+              <div className="space-y-2">
+                <HotkeyRow action="connect" label="Connect active" />
+                <HotkeyRow action="reset" label="Reset / Cancel All" />
+                <HotkeyRow action="stream" label="Start screen stream" />
+                <HotkeyRow action="processes" label="Refresh processes" />
+              </div>
+              <div className="flex justify-end gap-2 text-[11px] text-muted-foreground">
+                <button
+                  onClick={resetHotkeys}
+                  className="px-2 py-1 rounded-lg border border-border bg-slate-900/60 hover:bg-slate-800"
+                >
+                  Reset defaults
+                </button>
+              </div>
             </div>
 
             {/* Targets */}
@@ -919,6 +1378,23 @@ export default function App() {
                               <span>Awaiting auth</span>
                             )}
                           </div>
+                          <div className="flex items-center gap-1 text-[10px] mt-1">
+                            <Activity className="w-3 h-3 text-slate-400" />
+                            <span
+                              className={
+                                t.activity.state === "error"
+                                  ? "text-rose-300"
+                                  : t.activity.state === "running"
+                                  ? "text-amber-200"
+                                  : "text-emerald-200"
+                              }
+                            >
+                              {t.activity.label}
+                            </span>
+                          </div>
+                          {t.lastError ? (
+                            <p className="text-[10px] text-rose-200 truncate mt-0.5">Last error: {t.lastError}</p>
+                          ) : null}
                         </div>
 
                         <div className="flex items-center gap-1.5">
@@ -1038,6 +1514,9 @@ export default function App() {
                       </div>
                       <p className="text-xs text-muted-foreground mt-1">
                         {active.connected ? "Connected" : active.connecting ? "Connecting" : "Disconnected"}
+                        <span className="ml-2 text-[11px]">
+                          · {active.activity.label}
+                        </span>
                         {broadcastMode && (
                           <span className="ml-2 inline-flex items-center gap-1 text-primary">
                             <RadioTower className="w-3 h-3" /> broadcast
@@ -1052,20 +1531,20 @@ export default function App() {
                         <>
                           <button
                             onClick={actionScreen}
-                            disabled={!canSend}
+                            disabled={actionsDisabled}
                             className={`inline-flex items-center gap-2 px-3 py-2 rounded-lg
                                       bg-slate-900/60 border border-border transition text-sm
-                                      ${!canSend ? "opacity-50 cursor-not-allowed" : "hover:bg-slate-800"}`}
+                                      ${actionsDisabled ? "opacity-50 cursor-not-allowed" : "hover:bg-slate-800"}`}
                           >
                             <Monitor className="w-4 h-4" /> Screen
                           </button>
 
                           <button
                             onClick={actionCamera}
-                            disabled={!canSend}
+                            disabled={actionsDisabled}
                             className={`inline-flex items-center gap-2 px-3 py-2 rounded-lg
                                       bg-slate-900/60 border border-border transition text-sm
-                                      ${!canSend ? "opacity-50 cursor-not-allowed" : "hover:bg-slate-800"}`}
+                                      ${actionsDisabled ? "opacity-50 cursor-not-allowed" : "hover:bg-slate-800"}`}
                           >
                             <Camera className="w-4 h-4" /> Camera
                           </button>
@@ -1083,10 +1562,10 @@ export default function App() {
                             />
                             <button
                               onClick={actionCameraVideo}
-                              disabled={!canSend}
+                              disabled={actionsDisabled}
                               className={`inline-flex items-center gap-2 px-2 py-1 rounded-md
                                         bg-primary/20 transition text-sm
-                                        ${!canSend ? "opacity-50 cursor-not-allowed" : "hover:bg-primary/30"}`}
+                                        ${actionsDisabled ? "opacity-50 cursor-not-allowed" : "hover:bg-primary/30"}`}
                             >
                               <Video className="w-4 h-4" /> Record
                             </button>
@@ -1115,10 +1594,10 @@ export default function App() {
                             />
                             <button
                               onClick={actionScreenStream}
-                              disabled={!canSend}
+                              disabled={actionsDisabled}
                               className={`inline-flex items-center gap-2 px-2 py-1 rounded-md
                                         bg-primary/20 transition text-sm
-                                        ${!canSend ? "opacity-50 cursor-not-allowed" : "hover:bg-primary/30"}`}
+                                        ${actionsDisabled ? "opacity-50 cursor-not-allowed" : "hover:bg-primary/30"}`}
                             >
                               <Send className="w-4 h-4" /> Stream
                             </button>
@@ -1131,7 +1610,10 @@ export default function App() {
                         <>
                           <button
                             onClick={actionListProcesses}
-                            className="inline-flex items-center gap-2 px-3 py-2 rounded-lg bg-slate-900/60 border border-border hover:bg-slate-800 transition text-sm"
+                            disabled={actionsDisabled}
+                            className={`inline-flex items-center gap-2 px-3 py-2 rounded-lg bg-slate-900/60 border border-border transition text-sm ${
+                              actionsDisabled ? "opacity-50 cursor-not-allowed" : "hover:bg-slate-800"
+                            }`}
                           >
                             <RefreshCw className="w-4 h-4" /> Processes
                           </button>
@@ -1143,7 +1625,10 @@ export default function App() {
                         <>
                           <button
                             onClick={actionPing}
-                            className="inline-flex items-center gap-2 px-3 py-2 rounded-lg bg-slate-900/60 border border-border hover:bg-slate-800 transition text-sm"
+                            disabled={actionsDisabled}
+                            className={`inline-flex items-center gap-2 px-3 py-2 rounded-lg bg-slate-900/60 border border-border transition text-sm ${
+                              actionsDisabled ? "opacity-50 cursor-not-allowed" : "hover:bg-slate-800"
+                            }`}
                           >
                             <Activity className="w-4 h-4" /> Ping
                           </button>
@@ -1165,7 +1650,10 @@ export default function App() {
                         />
                         <button
                           onClick={actionStartProcess}
-                          className="inline-flex items-center gap-2 px-2 py-1 rounded-md bg-primary/20 hover:bg-primary/30 transition text-sm"
+                          disabled={actionsDisabled}
+                          className={`inline-flex items-center gap-2 px-2 py-1 rounded-md bg-primary/20 transition text-sm ${
+                            actionsDisabled ? "opacity-50 cursor-not-allowed" : "hover:bg-primary/30"
+                          }`}
                         >
                           <Send className="w-4 h-4" /> Start
                         </button>
@@ -1183,7 +1671,10 @@ export default function App() {
                         />
                         <button
                           onClick={actionSendCustomJson}
-                          className="inline-flex items-center gap-2 px-2 py-1 rounded-md bg-primary/20 hover:bg-primary/30 transition text-sm"
+                          disabled={actionsDisabled}
+                          className={`inline-flex items-center gap-2 px-2 py-1 rounded-md bg-primary/20 transition text-sm ${
+                            actionsDisabled ? "opacity-50 cursor-not-allowed" : "hover:bg-primary/30"
+                          }`}
                         >
                           <Send className="w-4 h-4" /> Send
                         </button>
@@ -1278,7 +1769,10 @@ export default function App() {
                                   <td className="px-3 py-2 text-right">
                                     <button
                                       onClick={() => actionKillProcess(p.pid)}
-                                      className="h-6 w-6 rounded-lg border border-border bg-slate-900/60"
+                                      disabled={actionsDisabled}
+                                      className={`h-6 w-6 rounded-lg border border-border bg-slate-900/60 ${
+                                        actionsDisabled ? "opacity-50 cursor-not-allowed" : "hover:bg-slate-800"
+                                      }`}
                                     >
                                       <XCircle className="w-4 h-4 text-rose-300" />
                                     </button>
@@ -1340,34 +1834,34 @@ export default function App() {
       </div>
     </div>
 
-    {confirmAction.action ? (
+    {pendingControllerAction ? (
       <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-20 px-4">
         <div className="w-full max-w-sm rounded-2xl bg-slate-900 border border-border p-5 space-y-3 shadow-2xl">
           <div className="flex items-center gap-2">
             <Power className="w-5 h-5 text-primary" />
             <div>
-              <p className="text-lg font-semibold text-slate-50">Confirm {confirmAction.action}</p>
+              <p className="text-lg font-semibold text-slate-50 capitalize">
+                {pendingControllerAction} controller?
+              </p>
               <p className="text-xs text-muted-foreground">
-                Type {confirmAction.action === "restart" ? "RESTART" : "SHUTDOWN"} to continue. Admin only.
+                This only affects the controller process, not the OS. Active streams will stop.
               </p>
             </div>
           </div>
-          <input
-            value={confirmAction.code}
-            onChange={(e) => setConfirmAction((prev) => ({ ...prev, code: e.target.value }))}
-            className="w-full rounded-lg border border-border bg-slate-950/60 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary/60"
-            placeholder="Type keyword to confirm"
-          />
+          {controllerStatus?.pid ? (
+            <p className="text-[11px] text-muted-foreground">Current PID: {controllerStatus.pid}</p>
+          ) : null}
           <div className="flex items-center justify-end gap-2">
             <button
-              onClick={() => setConfirmAction({ action: null, code: "" })}
+              onClick={() => setPendingControllerAction(null)}
               className="px-3 py-2 rounded-lg border border-border text-sm hover:bg-slate-800"
             >
               Cancel
             </button>
             <button
-              onClick={confirmPowerAction}
-              className="px-3 py-2 rounded-lg bg-primary text-sm font-semibold text-slate-50 hover:opacity-90"
+              onClick={confirmControllerAction}
+              disabled={controllerBusy}
+              className="px-3 py-2 rounded-lg bg-primary text-sm font-semibold text-slate-50 hover:opacity-90 disabled:opacity-60"
             >
               Confirm
             </button>
@@ -1376,9 +1870,17 @@ export default function App() {
       </div>
     ) : null}
 
-    {toastMessage ? (
-      <div className="fixed bottom-6 right-6 z-30 rounded-lg border border-emerald-400/40 bg-emerald-500/20 px-4 py-2 text-sm text-emerald-100 shadow-lg">
-        {toastMessage}
+    {toast ? (
+      <div
+        className={`fixed bottom-6 right-6 z-30 rounded-lg border px-4 py-2 text-sm shadow-lg ${
+          toast.tone === "success"
+            ? "border-emerald-400/40 bg-emerald-500/20 text-emerald-100"
+            : toast.tone === "error"
+            ? "border-rose-400/40 bg-rose-500/20 text-rose-100"
+            : "border-slate-500/40 bg-slate-800/70 text-slate-100"
+        }`}
+      >
+        {toast.text}
       </div>
     ) : null}
     </>

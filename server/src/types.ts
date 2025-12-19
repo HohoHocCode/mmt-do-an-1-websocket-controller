@@ -16,3 +16,22 @@ export interface AuthenticatedUser {
   username: string;
   role: UserRole;
 }
+
+export interface DiscoveryResult {
+  ip: string;
+  wsPort: number | null;
+  name?: string;
+  version?: string;
+  nonce?: string;
+  lastSeenMs: number;
+}
+
+export interface ControllerStatus {
+  status: "idle" | "running" | "stopped" | "error";
+  pid?: number;
+  startedAt?: number;
+  stoppedAt?: number;
+  lastExit?: { code: number | null; signal: NodeJS.Signals | null; at: number };
+  message?: string;
+  command?: string;
+}

@@ -32,4 +32,20 @@ export interface DiscoveryDevice {
   ip?: string;
   wsPort?: number | null;
   version?: string;
+  nonce?: string;
+  lastSeenMs?: number;
+}
+
+export type HotkeyAction = "connect" | "reset" | "stream" | "processes";
+
+export type HotkeyMap = Record<HotkeyAction, string>;
+
+export interface ControllerStatus {
+  status: "idle" | "running" | "stopped" | "error";
+  pid?: number;
+  startedAt?: number;
+  stoppedAt?: number;
+  lastExit?: { code: number | null; signal: string | null; at: number };
+  message?: string;
+  command?: string;
 }

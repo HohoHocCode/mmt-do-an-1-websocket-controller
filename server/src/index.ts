@@ -1,5 +1,4 @@
 import cors from "cors";
-import dgram from "dgram";
 import express, { NextFunction, Request, Response } from "express";
 import { z } from "zod";
 import { config } from "./config";
@@ -12,7 +11,9 @@ import {
   verifyPassword,
   verifySetupToken,
 } from "./authService";
-import { AuthenticatedUser, UserRow } from "./types";
+import { controllerManager } from "./controllerManager";
+import { discoverOnLan } from "./discovery";
+import { AuthenticatedUser, ControllerStatus, UserRow } from "./types";
 
 const app = express();
 app.use(cors());
@@ -63,6 +64,14 @@ function requireAuth(req: Request, res: Response, next: NextFunction) {
     return res.status(401).json({ ok: false, error: "Invalid token" });
   }
   (req as AuthedRequest).user = user;
+  next();
+}
+
+function requireAdmin(req: Request, res: Response, next: NextFunction) {
+  const user = (req as AuthedRequest).user;
+  if (!user || user.role !== "admin") {
+    return res.status(403).json({ ok: false, error: "Admin role required" });
+  }
   next();
 }
 
@@ -163,56 +172,43 @@ app.post("/audit", requireAuth, async (req: Request, res: Response) => {
   res.json({ ok: true });
 });
 
-function discoverDevices(): Promise<any[]> {
-  const broadcastMessage = Buffer.from(
-    JSON.stringify({ type: "mmt_discover", name: "mmt-controller", version: "dev" })
-  );
-
-  return new Promise((resolve) => {
-    const socket = dgram.createSocket("udp4");
-    const results: any[] = [];
-
-    socket.on("message", (msg, rinfo) => {
-      try {
-        const parsed = JSON.parse(msg.toString());
-        results.push({
-          ...parsed,
-          ip: parsed.ip ?? rinfo.address,
-          wsPort: parsed.wsPort ?? parsed.port ?? null,
-        });
-      } catch {
-        // ignore
-      }
-    });
-
-    socket.on("error", (err) => {
-      console.error("[discover] socket error", err);
-      socket.close();
-      resolve(results);
-    });
-
-    socket.bind(() => {
-      try {
-        socket.setBroadcast(true);
-        socket.send(broadcastMessage, 0, broadcastMessage.length, config.DISCOVERY_PORT, "255.255.255.255");
-      } catch (err) {
-        console.error("[discover] failed to broadcast", err);
-        socket.close();
-        resolve(results);
-        return;
-      }
-    });
-
-    setTimeout(() => {
-      socket.close();
-      resolve(results);
-    }, 1500);
+app.post("/api/discover", requireAuth, async (req: Request, res: Response) => {
+  const schema = z.object({
+    timeoutMs: z.number().int().positive().max(5000).optional(),
+    retries: z.number().int().min(1).max(5).optional(),
   });
-}
+  const parsed = schema.safeParse(req.body ?? {});
+  if (!parsed.success) {
+    return res.status(400).json({ ok: false, error: "Invalid payload" });
+  }
+  const devices = await discoverOnLan(parsed.data);
+  res.json({ ok: true, devices });
+});
 
 app.get("/devices/discover", requireAuth, async (_req: Request, res: Response) => {
-  const devices = await discoverDevices();
-  res.json({ devices });
+  const devices = await discoverOnLan();
+  res.json({ ok: true, devices });
+});
+
+app.get("/api/controller/status", requireAuth, (_req: Request, res: Response) => {
+  const status: ControllerStatus = controllerManager.getStatus();
+  res.json({ ok: true, status });
+});
+
+app.post("/api/controller/restart", requireAuth, requireAdmin, async (_req: Request, res: Response) => {
+  const status = await controllerManager.restart();
+  if (status.status === "error") {
+    return res.status(500).json({ ok: false, error: status.message ?? "Failed to restart", status });
+  }
+  res.json({ ok: true, status });
+});
+
+app.post("/api/controller/stop", requireAuth, requireAdmin, async (_req: Request, res: Response) => {
+  const status = await controllerManager.stop();
+  if (status.status === "error") {
+    return res.status(500).json({ ok: false, error: status.message ?? "Stop failed", status });
+  }
+  res.json({ ok: true, status });
 });
 
 app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
@@ -223,3 +219,14 @@ app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
 app.listen(config.BACKEND_PORT, () => {
   console.log(`[server] listening on port ${config.BACKEND_PORT}`);
 });
+
+const shouldAutoStart =
+  config.CONTROLLER_AUTO_START === true ||
+  config.CONTROLLER_AUTO_START === "1" ||
+  config.CONTROLLER_AUTO_START === "true";
+
+if (shouldAutoStart) {
+  controllerManager.start().catch((err) => {
+    console.error("[controller] auto-start failed:", err);
+  });
+}
