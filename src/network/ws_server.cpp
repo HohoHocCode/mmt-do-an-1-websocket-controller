@@ -21,6 +21,7 @@
 #include <cctype>
 #include <deque>
 #include <functional>
+#include <unordered_set>
 
 namespace asio  = boost::asio;
 namespace beast = boost::beast;
@@ -65,6 +66,12 @@ static bool env_flag(const char* key, bool fallback) {
     if (s == "1" || s == "true" || s == "yes" || s == "on") return true;
     if (s == "0" || s == "false" || s == "no" || s == "off") return false;
     return fallback;
+}
+
+static void apply_request_id(const Json& req, Json& resp) {
+    if (req.contains("requestId") && req["requestId"].is_string()) {
+        resp["requestId"] = req["requestId"];
+    }
 }
 
 static ParsedUrl parse_base_url(const std::string& url) {
@@ -295,8 +302,9 @@ class WebSocketSession : public std::enable_shared_from_this<WebSocketSession> {
 public:
     WebSocketSession(tcp::socket socket, asio::thread_pool& dispatcher_pool)
         : ws_(std::move(socket))
-        , stream_timer_(ws_.get_executor())   // timer dùng chung executor với websocket
-        , stream_guard_timer_(ws_.get_executor())
+        , strand_(asio::make_strand(ws_.get_executor()))
+        , stream_timer_(strand_)   // timer dùng chung executor với websocket
+        , stream_guard_timer_(strand_)
         , dispatcher_pool_(dispatcher_pool)
         , auth_api_base_(std::getenv("AUTH_API_URL") ? std::getenv("AUTH_API_URL") : "http://localhost:5179")
     {}
@@ -305,15 +313,19 @@ public:
         ws_.set_option(ws::stream_base::timeout::suggested(beast::role_type::server));
 
         ws_.async_accept(
-            beast::bind_front_handler(
-                &WebSocketSession::on_accept,
-                shared_from_this()
+            asio::bind_executor(
+                strand_,
+                beast::bind_front_handler(
+                    &WebSocketSession::on_accept,
+                    shared_from_this()
+                )
             )
         );
     }
 
 private:
     ws::stream<tcp::socket> ws_;
+    asio::strand<asio::any_io_executor> strand_;
 
     beast::flat_buffer buffer_;
     Dispatcher dispatcher_;
@@ -321,6 +333,9 @@ private:
     std::string auth_token_;
     std::string auth_api_base_;
     asio::thread_pool& dispatcher_pool_;
+    std::size_t pending_jobs_ = 0;
+    static constexpr std::size_t max_pending_jobs_ = 32;
+    std::unordered_set<std::string> inflight_cmds_;
 
     struct PendingMessage {
         std::shared_ptr<std::string> payload;
@@ -354,9 +369,12 @@ private:
     void do_read() {
         ws_.async_read(
             buffer_,
-            beast::bind_front_handler(
-                &WebSocketSession::on_read,
-                shared_from_this()
+            asio::bind_executor(
+                strand_,
+                beast::bind_front_handler(
+                    &WebSocketSession::on_read,
+                    shared_from_this()
+                )
             )
         );
     }
@@ -375,129 +393,226 @@ private:
 
         std::cout << "[WsServer] Received: " << req << "\n";
 
-        // ---- Check for screen_stream command ----
+        Json j;
         try {
-            Json j = Json::parse(req);
-            if (j.contains("cmd") && j["cmd"].is_string()) {
-                std::string cmd = j["cmd"];
-
-                if (cmd == "auth") {
-                    Json resp;
-                    resp["cmd"] = "auth";
-                    if (!j.contains("token") || !j["token"].is_string()) {
-                        resp["status"] = "error";
-                        resp["message"] = "token required";
-                    } else {
-                        std::string incoming_token = j["token"];
-                        auto verified = verify_with_auth_service(auth_api_base_, incoming_token);
-                        if (verified) {
-                            verified_user_ = verified;
-                            auth_token_ = incoming_token;
-                            resp["status"] = "ok";
-                            resp["username"] = verified->username;
-                            resp["role"] = verified->role;
-                        } else {
-                            verified_user_.reset();
-                            auth_token_.clear();
-                            resp["status"] = "error";
-                            resp["message"] = "Invalid token";
-                        }
-                    }
-                    send_text(resp.dump());
-                    do_read();
-                    return;
-                }
-
-                if (cmd == "restart" || cmd == "shutdown") {
-                    Json resp;
-                    resp["cmd"] = cmd;
-                    if (!verified_user_ || verified_user_->role != "admin") {
-                        resp["status"] = "error";
-                        resp["message"] = "admin_token_required";
-                        send_text(resp.dump());
-                        do_read();
-                        return;
-                    }
-                    SystemControl control;
-                    bool ok = cmd == "shutdown" ? control.shutdown() : control.restart();
-                    resp["status"] = ok ? "accepted" : "error";
-                    if (!ok) resp["message"] = "not_supported";
-
-                    if (ok && !auth_token_.empty()) {
-                        Json meta;
-                        meta["cmd"] = cmd;
-                        send_audit_remote(auth_api_base_, auth_token_, cmd, meta);
-                    }
-
-                    send_text(resp.dump());
-                    do_read();
-                    return;
-                }
-
-                if (cmd == "cancel_all") {
-                    stop_stream("cancel_all");
-                    Json ack;
-                    ack["cmd"] = "cancel_all";
-                    ack["status"] = "ok";
-                    send_text(ack.dump());
-                    do_read();
-                    return;
-                }
-
-                if (cmd == "stop_stream") {
-                    stop_stream("user");
-                    Json ack;
-                    ack["cmd"] = "screen_stream";
-                    ack["status"] = "stopped";
-                    send_text(ack.dump());
-                    do_read();
-                    return;
-                }
-
-                if (cmd == "reset") {
-                    stop_stream("reset");
-                    Json ack;
-                    ack["cmd"] = "reset";
-                    ack["status"] = "ok";
-                    ack["message"] = "Session reset";
-                    send_text(ack.dump());
-                    do_read();
-                    return;
-                }
-
-                if (cmd == "screen_stream") {
-                    int duration = j.value("duration", 5);
-                    int fps = j.value("fps", 5);
-
-                    Json ack;
-                    ack["cmd"] = "screen_stream";
-                    if (!start_screen_stream(duration, fps)) {
-                        ack["status"] = "error";
-                        ack["message"] = "already_streaming";
-                    } else {
-                        ack["status"] = "started";
-                        ack["duration"] = duration;
-                        ack["fps"] = fps;
-                    }
-
-                    send_text(ack.dump());
-
-                    do_read();
-                    return;
-                }
-            }
+            j = Json::parse(req);
+        } catch (const std::exception& e) {
+            Json resp;
+            resp["cmd"] = "unknown";
+            resp["status"] = "error";
+            resp["message"] = std::string("invalid_json: ") + e.what();
+            send_text(resp.dump());
+            do_read();
+            return;
         }
-        catch (...) {}
 
-        // ---- Default: use dispatcher ----
+        if (!j.contains("cmd") || !j["cmd"].is_string()) {
+            Json resp;
+            resp["cmd"] = "unknown";
+            resp["status"] = "error";
+            resp["message"] = "missing_cmd";
+            apply_request_id(j, resp);
+            send_text(resp.dump());
+            do_read();
+            return;
+        }
+
+        std::string cmd = j["cmd"];
+
+        if (cmd == "screen_stream") {
+            int duration = j.value("duration", 5);
+            int fps = j.value("fps", 5);
+
+            Json ack;
+            ack["cmd"] = "screen_stream";
+            if (!start_screen_stream(duration, fps)) {
+                ack["status"] = "error";
+                ack["message"] = "already_streaming";
+            } else {
+                ack["status"] = "started";
+                ack["duration"] = duration;
+                ack["fps"] = fps;
+            }
+            apply_request_id(j, ack);
+            send_text(ack.dump());
+            do_read();
+            return;
+        }
+
+        if (cmd == "stop_stream") {
+            stop_stream("user");
+            Json ack;
+            ack["cmd"] = "screen_stream";
+            ack["status"] = "stopped";
+            apply_request_id(j, ack);
+            send_text(ack.dump());
+            do_read();
+            return;
+        }
+
+        if (cmd == "cancel_all") {
+            stop_stream("cancel_all");
+            Json ack;
+            ack["cmd"] = "cancel_all";
+            ack["status"] = "ok";
+            apply_request_id(j, ack);
+            send_text(ack.dump());
+            do_read();
+            return;
+        }
+
+        if (cmd == "reset") {
+            stop_stream("reset");
+            Json ack;
+            ack["cmd"] = "reset";
+            ack["status"] = "ok";
+            ack["message"] = "Session reset";
+            apply_request_id(j, ack);
+            send_text(ack.dump());
+            do_read();
+            return;
+        }
+
+        if (cmd == "auth") {
+            if (!j.contains("token") || !j["token"].is_string()) {
+                Json resp;
+                resp["cmd"] = "auth";
+                resp["status"] = "error";
+                resp["message"] = "token required";
+                apply_request_id(j, resp);
+                send_text(resp.dump());
+                do_read();
+                return;
+            }
+
+            if (!reserve_job(cmd, j)) {
+                do_read();
+                return;
+            }
+
+            std::string incoming_token = j["token"];
+            auto self = shared_from_this();
+            asio::post(dispatcher_pool_, [self, request = std::move(j), incoming_token]() mutable {
+                Json resp;
+                resp["cmd"] = "auth";
+                auto verified = verify_with_auth_service(self->auth_api_base_, incoming_token);
+                if (verified) {
+                    resp["status"] = "ok";
+                    resp["username"] = verified->username;
+                    resp["role"] = verified->role;
+                } else {
+                    resp["status"] = "error";
+                    resp["message"] = "Invalid token";
+                }
+                apply_request_id(request, resp);
+
+                asio::post(self->strand_, [self, incoming_token, verified, resp = std::move(resp)]() mutable {
+                    if (verified) {
+                        self->verified_user_ = verified;
+                        self->auth_token_ = incoming_token;
+                    } else {
+                        self->verified_user_.reset();
+                        self->auth_token_.clear();
+                    }
+                    self->send_text(resp.dump());
+                    self->finish_job("auth");
+                });
+            });
+            do_read();
+            return;
+        }
+
+        if (cmd == "restart" || cmd == "shutdown") {
+            if (!verified_user_ || verified_user_->role != "admin") {
+                Json resp;
+                resp["cmd"] = cmd;
+                resp["status"] = "error";
+                resp["message"] = "admin_token_required";
+                apply_request_id(j, resp);
+                send_text(resp.dump());
+                do_read();
+                return;
+            }
+
+            if (!reserve_job(cmd, j)) {
+                do_read();
+                return;
+            }
+
+            const std::string token = auth_token_;
+            const std::string auth_base = auth_api_base_;
+            auto self = shared_from_this();
+            asio::post(dispatcher_pool_, [self, request = std::move(j), cmd, token, auth_base]() mutable {
+                Json resp;
+                resp["cmd"] = cmd;
+                SystemControl control;
+                bool ok = cmd == "shutdown" ? control.shutdown() : control.restart();
+                resp["status"] = ok ? "accepted" : "error";
+                if (!ok) resp["message"] = "not_supported";
+
+                if (ok && !token.empty()) {
+                    Json meta;
+                    meta["cmd"] = cmd;
+                    send_audit_remote(auth_base, token, cmd, meta);
+                }
+
+                apply_request_id(request, resp);
+                asio::post(self->strand_, [self, cmd, resp = std::move(resp)]() mutable {
+                    self->send_text(resp.dump());
+                    self->finish_job(cmd);
+                });
+            });
+            do_read();
+            return;
+        }
+
+        enqueue_dispatch_job(cmd, std::move(req), j);
+        do_read();
+    }
+
+    void send_error_response(const std::string& cmd, const Json& req, const std::string& message) {
+        Json resp;
+        resp["cmd"] = cmd;
+        resp["status"] = "error";
+        resp["message"] = message;
+        apply_request_id(req, resp);
+        send_text(resp.dump());
+    }
+
+    bool reserve_job(const std::string& cmd, const Json& req) {
+        if (pending_jobs_ >= max_pending_jobs_) {
+            send_error_response(cmd, req, "too many pending requests");
+            return false;
+        }
+        if (inflight_cmds_.count(cmd) > 0) {
+            send_error_response(cmd, req, "busy");
+            return false;
+        }
+        inflight_cmds_.insert(cmd);
+        pending_jobs_++;
+        return true;
+    }
+
+    void finish_job(const std::string& cmd) {
+        inflight_cmds_.erase(cmd);
+        if (pending_jobs_ > 0) {
+            pending_jobs_--;
+        }
+    }
+
+    void enqueue_dispatch_job(const std::string& cmd, std::string request, const Json& req) {
+        if (!reserve_job(cmd, req)) {
+            return;
+        }
+
         auto self = shared_from_this();
-        asio::post(dispatcher_pool_, [self, request = std::move(req)]() mutable {
+        asio::post(dispatcher_pool_, [self, cmd, request = std::move(request)]() mutable {
             std::string resp = self->dispatcher_.handle(request);
-            asio::post(self->ws_.get_executor(), [self, response = std::move(resp)]() mutable {
+            asio::post(self->strand_, [self, cmd, response = std::move(resp)]() mutable {
                 self->send_text(response);
+                self->finish_job(cmd);
             });
         });
-        do_read();
     }
 
     // ------------------------------------------------------------------------
