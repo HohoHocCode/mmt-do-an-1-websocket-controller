@@ -22,9 +22,28 @@ struct LoginResult {
     AuthUserRecord user;
 };
 
+enum class LoginStatus {
+    Ok,
+    NotFound,
+    NeedsPasswordSet,
+    InvalidCredentials,
+    DbUnavailable,
+    Error
+};
+
+struct LoginOutcome {
+    LoginStatus status = LoginStatus::Error;
+    std::optional<LoginResult> result;
+};
+
 struct UserWithSecret {
     AuthUserRecord user;
     std::optional<std::string> password_hash;
+};
+
+struct UserLookupResult {
+    std::optional<UserWithSecret> user;
+    bool db_error = false;
 };
 
 class AuthService {
@@ -33,7 +52,7 @@ public:
 
     Json precheck(const std::string& username);
     Json register_user(const std::string& username, const std::string& password);
-    std::optional<LoginResult> login(const std::string& username, const std::string& password);
+    LoginOutcome login(const std::string& username, const std::string& password);
     Json set_password(const std::string& username, const std::string& password);
     std::optional<AuthUserRecord> verify(const std::string& token) const;
 
@@ -42,7 +61,7 @@ private:
     mutable std::shared_mutex tokens_mutex_;
     std::unordered_map<std::string, AuthUserRecord> sessions_;
 
-    std::optional<UserWithSecret> get_user(const std::string& username) const;
+    UserLookupResult get_user(const std::string& username) const;
     bool save_user(const std::string& username, const std::string& password_hash);
     bool update_password_if_missing(const std::string& username, const std::string& password_hash);
     void remember_token(const std::string& token, const AuthUserRecord& user);

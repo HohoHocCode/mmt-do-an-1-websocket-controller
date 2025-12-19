@@ -37,7 +37,9 @@ async function request<T>(
   return data as T;
 }
 
-export type LoginResponse = { token: string; user: AuthUser };
+export type LoginResponse =
+  | { token: string; user: AuthUser }
+  | { status: "not_found" | "needs_password_set" };
 export type StatusResponse = { exists: boolean; hasPassword: boolean };
 
 export function precheckUser(username: string) {

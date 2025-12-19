@@ -18,20 +18,20 @@ void close_stmt(MYSQL_STMT* stmt) {
 
 AuthService::AuthService(Database db) : db_(std::move(db)) {}
 
-std::optional<UserWithSecret> AuthService::get_user(const std::string& username) const {
+UserLookupResult AuthService::get_user(const std::string& username) const {
     try {
         auto conn = db_.connect();
 
         std::unique_ptr<MYSQL_STMT, decltype(&mysql_stmt_close)> stmt(mysql_stmt_init(conn.get()), &mysql_stmt_close);
         if (!stmt) {
             Logger::instance().error("mysql_stmt_init failed");
-            return std::nullopt;
+            return UserLookupResult{std::nullopt, true};
         }
 
         const char* sql = "SELECT id, username, password_hash, created_at FROM users WHERE username = ?";
         if (mysql_stmt_prepare(stmt.get(), sql, static_cast<unsigned long>(std::strlen(sql))) != 0) {
             Logger::instance().error("mysql_stmt_prepare failed: " + std::string(mysql_stmt_error(stmt.get())));
-            return std::nullopt;
+            return UserLookupResult{std::nullopt, true};
         }
 
         MYSQL_BIND param{};
@@ -42,17 +42,17 @@ std::optional<UserWithSecret> AuthService::get_user(const std::string& username)
 
         if (mysql_stmt_bind_param(stmt.get(), &param) != 0) {
             Logger::instance().error("mysql_stmt_bind_param failed: " + std::string(mysql_stmt_error(stmt.get())));
-            return std::nullopt;
+            return UserLookupResult{std::nullopt, true};
         }
 
         if (mysql_stmt_execute(stmt.get()) != 0) {
             Logger::instance().error("mysql_stmt_execute failed: " + std::string(mysql_stmt_error(stmt.get())));
-            return std::nullopt;
+            return UserLookupResult{std::nullopt, true};
         }
 
         if (mysql_stmt_store_result(stmt.get()) != 0) {
             Logger::instance().error("mysql_stmt_store_result failed: " + std::string(mysql_stmt_error(stmt.get())));
-            return std::nullopt;
+            return UserLookupResult{std::nullopt, true};
         }
 
         int id = 0;
@@ -90,17 +90,17 @@ std::optional<UserWithSecret> AuthService::get_user(const std::string& username)
 
         if (mysql_stmt_bind_result(stmt.get(), result) != 0) {
             Logger::instance().error("mysql_stmt_bind_result failed: " + std::string(mysql_stmt_error(stmt.get())));
-            return std::nullopt;
+            return UserLookupResult{std::nullopt, true};
         }
 
         const int fetch_code = mysql_stmt_fetch(stmt.get());
         if (fetch_code == MYSQL_NO_DATA) {
-            return std::nullopt;
+            return UserLookupResult{std::nullopt, false};
         }
 
         if (fetch_code != 0 && fetch_code != MYSQL_DATA_TRUNCATED) {
             Logger::instance().error("mysql_stmt_fetch failed: " + std::string(mysql_stmt_error(stmt.get())));
-            return std::nullopt;
+            return UserLookupResult{std::nullopt, true};
         }
 
         UserWithSecret result_row;
@@ -113,10 +113,10 @@ std::optional<UserWithSecret> AuthService::get_user(const std::string& username)
         if (!password_null && password_len > 0) {
             result_row.password_hash = std::string(password_buf, password_len);
         }
-        return result_row;
+        return UserLookupResult{result_row, false};
     } catch (const std::exception& e) {
         Logger::instance().error(std::string("get_user failed: ") + e.what());
-        return std::nullopt;
+        return UserLookupResult{std::nullopt, true};
     }
 }
 
@@ -214,8 +214,14 @@ Json AuthService::precheck(const std::string& username) {
     }
     auto row = get_user(username);
     Json res;
-    res["exists"] = row.has_value();
-    res["hasPassword"] = row.has_value() && row->user.has_password;
+    if (row.db_error) {
+        res["exists"] = false;
+        res["hasPassword"] = false;
+        res["error"] = "db_unavailable";
+        return res;
+    }
+    res["exists"] = row.user.has_value();
+    res["hasPassword"] = row.user.has_value() && row.user->user.has_password;
     return res;
 }
 
@@ -226,7 +232,10 @@ Json AuthService::register_user(const std::string& username, const std::string& 
 
     try {
         auto existing = get_user(username);
-        if (existing.has_value()) {
+        if (existing.db_error) {
+            return {{"ok", false}, {"error", "db_unavailable"}};
+        }
+        if (existing.user.has_value()) {
             return {{"ok", false}, {"error", "user_exists"}};
         }
 
@@ -251,22 +260,29 @@ Json AuthService::register_user(const std::string& username, const std::string& 
     }
 }
 
-std::optional<LoginResult> AuthService::login(const std::string& username, const std::string& password) {
+LoginOutcome AuthService::login(const std::string& username, const std::string& password) {
     try {
         auto row = get_user(username);
-        if (!row.has_value()) return std::nullopt;
-        if (!row->password_hash.has_value() || row->password_hash->empty()) return std::nullopt;
+        if (row.db_error) {
+            return LoginOutcome{LoginStatus::DbUnavailable, std::nullopt};
+        }
+        if (!row.user.has_value()) {
+            return LoginOutcome{LoginStatus::NotFound, std::nullopt};
+        }
+        if (!row.user->password_hash.has_value() || row.user->password_hash->empty()) {
+            return LoginOutcome{LoginStatus::NeedsPasswordSet, std::nullopt};
+        }
 
-        if (!verify_password_hash(password, *row->password_hash)) {
-            return std::nullopt;
+        if (!verify_password_hash(password, *row.user->password_hash)) {
+            return LoginOutcome{LoginStatus::InvalidCredentials, std::nullopt};
         }
 
         auto token = generate_token();
-        remember_token(token, row->user);
-        return LoginResult{token, row->user};
+        remember_token(token, row.user->user);
+        return LoginOutcome{LoginStatus::Ok, LoginResult{token, row.user->user}};
     } catch (const std::exception& e) {
         Logger::instance().error(std::string("login failed: ") + e.what());
-        return std::nullopt;
+        return LoginOutcome{LoginStatus::Error, std::nullopt};
     }
 }
 
@@ -276,10 +292,13 @@ Json AuthService::set_password(const std::string& username, const std::string& p
     }
     try {
         auto row = get_user(username);
-        if (!row.has_value()) {
+        if (row.db_error) {
+            return {{"ok", false}, {"error", "db_unavailable"}};
+        }
+        if (!row.user.has_value()) {
             return {{"ok", false}, {"error", "not_found"}};
         }
-        if (row->user.has_password) {
+        if (row.user->user.has_password) {
             return {{"ok", false}, {"error", "password_already_set"}};
         }
 
