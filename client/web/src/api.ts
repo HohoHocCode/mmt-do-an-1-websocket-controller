@@ -1,6 +1,7 @@
 import { AuthUser, ControllerStatus, DiscoveryDevice } from "./types";
 
-const API_URL = import.meta.env.VITE_API_URL || "http://localhost:5179";
+const RAW_API_URL = import.meta.env.VITE_API_URL || "";
+const API_URL = RAW_API_URL.endsWith("/") ? RAW_API_URL.slice(0, -1) : RAW_API_URL;
 
 export class ApiError extends Error {
   status?: number;
@@ -37,27 +38,36 @@ async function request<T>(
 export type LoginResponse = { token: string; user: AuthUser };
 export type StatusResponse = { exists: boolean; hasPassword: boolean };
 
-export function getStatus(username: string) {
-  const qs = new URLSearchParams({ username });
-  return request<StatusResponse>(`/auth/status?${qs.toString()}`);
+export function precheckUser(username: string) {
+  return request<StatusResponse>("/api/auth/precheck", {
+    method: "POST",
+    body: JSON.stringify({ username }),
+  });
 }
 
-export function setPassword(payload: { username: string; setupToken: string; newPassword: string }) {
-  return request<{ ok: boolean }>("/auth/set-password", {
+export function registerUser(payload: { username: string; password?: string }) {
+  return request<{ ok: boolean; user?: AuthUser; error?: string }>("/api/auth/register", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function setPassword(payload: { username: string; password: string }) {
+  return request<{ ok: boolean; error?: string }>("/api/auth/set-password", {
     method: "POST",
     body: JSON.stringify(payload),
   });
 }
 
 export function login(payload: { username: string; password: string }) {
-  return request<LoginResponse>("/auth/login", {
+  return request<LoginResponse>("/api/auth/login", {
     method: "POST",
     body: JSON.stringify(payload),
   });
 }
 
 export function verifyToken(token: string) {
-  return request<{ ok: boolean; user?: AuthUser }>("/auth/verify", {
+  return request<{ ok: boolean; user?: AuthUser }>("/api/auth/verify", {
     method: "POST",
     body: JSON.stringify({ token }),
   });
@@ -65,15 +75,15 @@ export function verifyToken(token: string) {
 
 export function logAudit(token: string, action: string, meta: Record<string, unknown> = {}) {
   return request<{ ok: boolean }>(
-    "/audit",
+    "/api/audit",
     { method: "POST", body: JSON.stringify({ action, meta }) },
     token
   );
 }
 
-export function discoverDevices(token: string, payload?: { timeoutMs?: number; retries?: number }) {
+export function discoverDevices(token: string, payload?: { timeoutMs?: number; retries?: number; port?: number }) {
   return request<{ ok: boolean; devices: DiscoveryDevice[] }>(
-    "/api/discover",
+    "/api/discover/start",
     { method: "POST", body: JSON.stringify(payload ?? {}) },
     token
   );
