@@ -24,7 +24,8 @@ const envSchema = z.object({
   JWT_SECRET: z.string().min(10, "JWT_SECRET must be set"),
   SETUP_TOKEN_SECRET: z.string().min(10, "SETUP_TOKEN_SECRET must be set"),
   AUTH_TOKEN_TTL_SECONDS: z.coerce.number().int().positive().default(86400),
-  BACKEND_PORT: z.coerce.number().int().positive().default(5179),
+  HOST: z.string().default("127.0.0.1"),
+  PORT: z.coerce.number().int().positive().default(8080),
   DISCOVERY_PORT: z.coerce.number().int().positive().default(41000),
   DISCOVERY_TIMEOUT_MS: z.coerce.number().int().positive().default(1800),
   DISCOVERY_RETRIES: z.coerce.number().int().positive().max(5).default(2),
@@ -38,4 +39,9 @@ const envSchema = z.object({
     .default("0"),
 });
 
-export const config = envSchema.parse(process.env);
+const envInput = {
+  ...process.env,
+  PORT: process.env.PORT ?? process.env.BACKEND_PORT,
+};
+
+export const config = envSchema.parse(envInput);

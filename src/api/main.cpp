@@ -22,9 +22,68 @@ unsigned int env_or_uint(const char* key, unsigned int fallback) {
         return fallback;
     }
 }
+
+bool parse_port_value(const std::string& value, unsigned short& port) {
+    try {
+        const auto parsed = std::stoul(value);
+        if (parsed == 0 || parsed > 65535) return false;
+        port = static_cast<unsigned short>(parsed);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+struct ApiRuntimeConfig {
+    std::string host;
+    unsigned short port;
+};
+
+ApiRuntimeConfig resolve_runtime_config(int argc, char* argv[]) {
+    ApiRuntimeConfig config;
+    config.host = env_or("HOST", "0.0.0.0");
+
+    unsigned int port_candidate = env_or_uint("PORT", 0);
+    if (port_candidate == 0) {
+        port_candidate = env_or_uint("API_PORT", 8080);
+    }
+    if (port_candidate == 0 || port_candidate > 65535) {
+        port_candidate = 8080;
+    }
+    config.port = static_cast<unsigned short>(port_candidate);
+
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--host" && i + 1 < argc) {
+            config.host = argv[++i];
+            continue;
+        }
+        if (arg.rfind("--host=", 0) == 0) {
+            config.host = arg.substr(std::string("--host=").size());
+            continue;
+        }
+        if (arg == "--port" && i + 1 < argc) {
+            unsigned short parsed = 0;
+            if (parse_port_value(argv[i + 1], parsed)) {
+                config.port = parsed;
+            }
+            ++i;
+            continue;
+        }
+        if (arg.rfind("--port=", 0) == 0) {
+            unsigned short parsed = 0;
+            if (parse_port_value(arg.substr(std::string("--port=").size()), parsed)) {
+                config.port = parsed;
+            }
+            continue;
+        }
+    }
+
+    return config;
+}
 } // namespace
 
-int main() {
+int main(int argc, char* argv[]) {
     try {
         DbConfig cfg;
         cfg.host = env_or("DB_HOST", "127.0.0.1");
@@ -33,9 +92,9 @@ int main() {
         cfg.database = env_or("DB_NAME", "mmt_remote");
         cfg.port = env_or_uint("DB_PORT", 3306);
 
-        const unsigned short port = static_cast<unsigned short>(env_or_uint("API_PORT", 8080));
+        const ApiRuntimeConfig runtime = resolve_runtime_config(argc, argv);
 
-        ApiServer server("0.0.0.0", port, Database(cfg));
+        ApiServer server(runtime.host, runtime.port, Database(cfg));
         server.run();
     } catch (const std::exception& e) {
         Logger::instance().error(std::string("API crashed: ") + e.what());
