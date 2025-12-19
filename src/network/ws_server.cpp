@@ -444,6 +444,16 @@ private:
                     return;
                 }
 
+                if (cmd == "stop_stream") {
+                    stop_stream("user");
+                    Json ack;
+                    ack["cmd"] = "screen_stream";
+                    ack["status"] = "stopped";
+                    send_text(ack.dump());
+                    do_read();
+                    return;
+                }
+
                 if (cmd == "reset") {
                     stop_stream("reset");
                     Json ack;
@@ -459,13 +469,16 @@ private:
                     int duration = j.value("duration", 5);
                     int fps = j.value("fps", 5);
 
-                    start_screen_stream(duration, fps);
-
                     Json ack;
                     ack["cmd"] = "screen_stream";
-                    ack["status"] = "started";
-                    ack["duration"] = duration;
-                    ack["fps"] = fps;
+                    if (!start_screen_stream(duration, fps)) {
+                        ack["status"] = "error";
+                        ack["message"] = "already_streaming";
+                    } else {
+                        ack["status"] = "started";
+                        ack["duration"] = duration;
+                        ack["fps"] = fps;
+                    }
 
                     send_text(ack.dump());
 
@@ -489,10 +502,10 @@ private:
 
     // ------------------------------------------------------------------------
     void send_text(const std::string& s) {
-        enqueue_message(s, false, nullptr);
+        enqueue_send(s, false, nullptr);
     }
 
-    void enqueue_message(
+    void enqueue_send(
         const std::string& s,
         bool is_stream_frame,
         std::function<void(const beast::error_code&)> on_complete
@@ -538,10 +551,10 @@ private:
     }
 
     // ------------------------------------------------------------------------
-    void start_screen_stream(int duration, int fps) {
+    bool start_screen_stream(int duration, int fps) {
         if (streaming_) {
-            std::cout << "[WsServer] Already streaming\n";
-            return;
+            std::cout << "[WsServer] Screen stream request rejected: already streaming\n";
+            return false;
         }
 
         if (fps < 1) fps = 1;
@@ -574,6 +587,7 @@ private:
                 self->do_stream_frame(ec, generation);
             }
         );
+        return true;
     }
 
     // ------------------------------------------------------------------------
@@ -617,7 +631,7 @@ private:
         j["seq"] = stream_seq_;
         j["image_base64"] = b64;
 
-        enqueue_message(
+        enqueue_send(
             j.dump(),
             true,
             [self = shared_from_this(), generation](const beast::error_code& write_ec) {
