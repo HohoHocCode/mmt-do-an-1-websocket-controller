@@ -19,6 +19,8 @@
 #include <atomic>
 #include <array>
 #include <cctype>
+#include <deque>
+#include <functional>
 
 namespace asio  = boost::asio;
 namespace beast = boost::beast;
@@ -291,10 +293,11 @@ private:
 // ============================================================================
 class WebSocketSession : public std::enable_shared_from_this<WebSocketSession> {
 public:
-    explicit WebSocketSession(tcp::socket socket)
+    WebSocketSession(tcp::socket socket, asio::thread_pool& dispatcher_pool)
         : ws_(std::move(socket))
         , stream_timer_(ws_.get_executor())   // timer dùng chung executor với websocket
         , stream_guard_timer_(ws_.get_executor())
+        , dispatcher_pool_(dispatcher_pool)
         , auth_api_base_(std::getenv("AUTH_API_URL") ? std::getenv("AUTH_API_URL") : "http://localhost:5179")
     {}
 
@@ -317,6 +320,16 @@ private:
     std::optional<VerifiedUser> verified_user_;
     std::string auth_token_;
     std::string auth_api_base_;
+    asio::thread_pool& dispatcher_pool_;
+
+    struct PendingMessage {
+        std::shared_ptr<std::string> payload;
+        bool is_stream_frame = false;
+        std::function<void(const beast::error_code&)> on_complete;
+    };
+
+    std::deque<PendingMessage> send_queue_;
+    bool write_in_progress_ = false;
 
     // Stream state
     asio::steady_timer stream_timer_;
@@ -464,25 +477,64 @@ private:
         catch (...) {}
 
         // ---- Default: use dispatcher ----
-        std::string resp = dispatcher_.handle(req);
-        send_text(resp);
-
+        auto self = shared_from_this();
+        asio::post(dispatcher_pool_, [self, request = std::move(req)]() mutable {
+            std::string resp = self->dispatcher_.handle(request);
+            asio::post(self->ws_.get_executor(), [self, response = std::move(resp)]() mutable {
+                self->send_text(response);
+            });
+        });
         do_read();
     }
 
     // ------------------------------------------------------------------------
     void send_text(const std::string& s) {
-        auto msg = std::make_shared<std::string>(s);
+        enqueue_message(s, false, nullptr);
+    }
 
+    void enqueue_message(
+        const std::string& s,
+        bool is_stream_frame,
+        std::function<void(const beast::error_code&)> on_complete
+    ) {
+        auto msg = std::make_shared<std::string>(s);
+        send_queue_.push_back(PendingMessage{msg, is_stream_frame, std::move(on_complete)});
+        if (!write_in_progress_) {
+            write_in_progress_ = true;
+            do_write();
+        }
+    }
+
+    void do_write() {
+        if (send_queue_.empty()) {
+            write_in_progress_ = false;
+            return;
+        }
+
+        auto msg = send_queue_.front().payload;
+        auto on_complete = send_queue_.front().on_complete;
         ws_.text(true);
         ws_.async_write(
             asio::buffer(*msg),
-            [self = shared_from_this(), msg](beast::error_code ec, std::size_t) {
-                if (ec) {
-                    std::cerr << "[WsServer] Write error: " << ec.message() << "\n";
+            [self = shared_from_this(), msg, on_complete](beast::error_code ec, std::size_t) {
+                if (on_complete) {
+                    on_complete(ec);
                 }
+                self->on_write(ec);
             }
         );
+    }
+
+    void on_write(const beast::error_code& ec) {
+        if (send_queue_.empty()) {
+            write_in_progress_ = false;
+            return;
+        }
+        send_queue_.pop_front();
+        if (ec) {
+            std::cerr << "[WsServer] Write error: " << ec.message() << "\n";
+        }
+        do_write();
     }
 
     // ------------------------------------------------------------------------
@@ -532,6 +584,13 @@ private:
         beast::error_code cancel_ec;
         stream_timer_.cancel(cancel_ec);
         stream_guard_timer_.cancel(cancel_ec);
+        for (auto it = send_queue_.begin(); it != send_queue_.end();) {
+            if (it->is_stream_frame) {
+                it = send_queue_.erase(it);
+            } else {
+                ++it;
+            }
+        }
         std::cout << "[WsServer] Stream stopped (" << reason << ")\n";
     }
 
@@ -558,20 +617,16 @@ private:
         j["seq"] = stream_seq_;
         j["image_base64"] = b64;
 
-        auto msg = std::make_shared<std::string>(j.dump());
-
-        ws_.text(true);
-        ws_.async_write(
-            asio::buffer(*msg),
-            [self = shared_from_this(), msg](beast::error_code ec, std::size_t) {
-                if (ec) {
-                    std::cerr << "[WsServer] Stream write error: "
-                              << ec.message() << "\n";
+        enqueue_message(
+            j.dump(),
+            true,
+            [self = shared_from_this(), generation](const beast::error_code& write_ec) {
+                if (write_ec) {
                     self->stop_stream("write_failed");
                     return;
                 }
 
-                if (!self->streaming_) return;
+                if (!self->streaming_ || generation != self->stream_generation_) return;
 
                 self->stream_seq_++;
 
@@ -596,9 +651,10 @@ private:
 // ============================================================================
 class Listener : public std::enable_shared_from_this<Listener> {
 public:
-    Listener(asio::io_context& ioc, tcp::endpoint endpoint)
+    Listener(asio::io_context& ioc, tcp::endpoint endpoint, asio::thread_pool& dispatcher_pool)
         : ioc_(ioc)
         , acceptor_(ioc)
+        , dispatcher_pool_(dispatcher_pool)
     {
         beast::error_code ec;
 
@@ -615,6 +671,7 @@ public:
 private:
     asio::io_context& ioc_;
     tcp::acceptor acceptor_;
+    asio::thread_pool& dispatcher_pool_;
 
     void do_accept() {
         acceptor_.async_accept(
@@ -628,7 +685,7 @@ private:
 
     void on_accept(beast::error_code ec, tcp::socket socket) {
         if (!ec) {
-            std::make_shared<WebSocketSession>(std::move(socket))->start();
+            std::make_shared<WebSocketSession>(std::move(socket), dispatcher_pool_)->start();
         }
         do_accept();
     }
@@ -641,6 +698,7 @@ private:
 struct WsServer::Impl {
     asio::io_context ioc;
     std::unique_ptr<DiscoveryResponder> discovery;
+    asio::thread_pool dispatcher_pool{std::max(2u, std::thread::hardware_concurrency())};
 
     void start(const std::string& addr, unsigned short port) {
         const bool enable_discovery = env_flag("DISCOVERY_ENABLED", true);
@@ -655,10 +713,11 @@ struct WsServer::Impl {
         }
 
         tcp::endpoint ep(asio::ip::make_address(addr), port);
-        std::make_shared<Listener>(ioc, ep)->run();
+        std::make_shared<Listener>(ioc, ep, dispatcher_pool)->run();
         std::cout << "[WsServer] Listening on " << addr << ":" << port << "\n";
         ioc.run();
 
+        dispatcher_pool.join();
         if (discovery) {
             discovery->stop();
         }
