@@ -30,6 +30,13 @@ cmake --build build
 
 > If your local toolchain uses a different preset or output directory, update the preset or pass `-Preset` to the script.
 
+### Build the C++ WebSocket server (Linux/Codex)
+
+```bash
+cmake --preset codex-linux
+cmake --build build/codex-linux --target server
+```
+
 ### Start the backend
 
 ```powershell
