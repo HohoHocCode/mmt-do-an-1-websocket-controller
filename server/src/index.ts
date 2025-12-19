@@ -21,6 +21,53 @@ app.use(express.json());
 
 type AuthedRequest = Request & { user?: AuthenticatedUser };
 
+type RuntimeOverrides = {
+  host?: string;
+  port?: number;
+};
+
+function parseRuntimeOverrides(argv: string[]): RuntimeOverrides {
+  const overrides: RuntimeOverrides = {};
+
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (arg === "--host" && argv[i + 1]) {
+      overrides.host = argv[i + 1];
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith("--host=")) {
+      overrides.host = arg.replace("--host=", "");
+      continue;
+    }
+    if (arg === "--port" && argv[i + 1]) {
+      const parsed = Number(argv[i + 1]);
+      if (Number.isInteger(parsed) && parsed > 0) {
+        overrides.port = parsed;
+      }
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith("--port=")) {
+      const value = arg.replace("--port=", "");
+      const parsed = Number(value);
+      if (Number.isInteger(parsed) && parsed > 0) {
+        overrides.port = parsed;
+      }
+    }
+  }
+
+  return overrides;
+}
+
+const runtimeOverrides = parseRuntimeOverrides(process.argv.slice(2));
+const resolvedHost = runtimeOverrides.host ?? config.HOST;
+const resolvedPort = runtimeOverrides.port ?? config.PORT;
+
+app.get("/health", (_req, res) => {
+  res.json({ ok: true, service: "node_api", port: resolvedPort });
+});
+
 function formatUser(row: any): UserRow {
   return {
     ...row,
@@ -216,8 +263,8 @@ app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
   res.status(500).json({ error: "Internal server error" });
 });
 
-app.listen(config.BACKEND_PORT, () => {
-  console.log(`[server] listening on port ${config.BACKEND_PORT}`);
+app.listen(resolvedPort, resolvedHost, () => {
+  console.log(`[server] listening on ${resolvedHost}:${resolvedPort}`);
 });
 
 const shouldAutoStart =

@@ -71,10 +71,12 @@ public:
     HttpSession(tcp::socket socket,
                 std::shared_ptr<AuthService> auth,
                 std::shared_ptr<ScreenStreamManager> stream,
-                std::shared_ptr<DiscoveryService> discovery)
+                std::shared_ptr<DiscoveryService> discovery,
+                unsigned short port)
         : stream_(std::move(stream))
         , auth_(std::move(auth))
         , discovery_(std::move(discovery))
+        , port_(port)
         , socket_(std::move(socket)) {}
 
     void run() {
@@ -85,6 +87,7 @@ private:
     std::shared_ptr<ScreenStreamManager> stream_;
     std::shared_ptr<AuthService> auth_;
     std::shared_ptr<DiscoveryService> discovery_;
+    unsigned short port_;
     tcp::socket socket_;
     beast::flat_buffer buffer_;
 
@@ -143,6 +146,16 @@ private:
 
         if (req.method() != http::verb::post && req.method() != http::verb::get) {
             handle_bad_request(std::move(req), "invalid_method", send);
+            return;
+        }
+
+        if (target == "/health" && req.method() == http::verb::get) {
+            http::response<http::string_body> res{http::status::ok, req.version()};
+            res.set(http::field::content_type, "application/json");
+            res.keep_alive(req.keep_alive());
+            res.body() = Json({{"ok", true}, {"service", "mmt_api"}, {"port", port_}}).dump();
+            res.prepare_payload();
+            send(std::move(res));
             return;
         }
 
@@ -371,6 +384,8 @@ private:
 ApiServer::ApiServer(const std::string& address, unsigned short port, Database db)
     : ioc_(1)
     , acceptor_(ioc_)
+    , address_(address)
+    , port_(port)
 {
     tcp::endpoint endpoint{asio::ip::make_address(address), port};
     acceptor_.open(endpoint.protocol());
@@ -384,7 +399,7 @@ ApiServer::ApiServer(const std::string& address, unsigned short port, Database d
 }
 
 void ApiServer::run() {
-    Logger::instance().info("API listening on 0.0.0.0:" + std::to_string(acceptor_.local_endpoint().port()));
+    Logger::instance().info("API listening on " + address_ + ":" + std::to_string(port_));
     do_accept();
     ioc_.run();
 }
@@ -393,7 +408,7 @@ void ApiServer::do_accept() {
     acceptor_.async_accept(asio::make_strand(ioc_),
         [this](beast::error_code ec, tcp::socket socket) {
             if (!ec) {
-                std::make_shared<HttpSession>(std::move(socket), auth_, stream_manager_, discovery_)->run();
+                std::make_shared<HttpSession>(std::move(socket), auth_, stream_manager_, discovery_, port_)->run();
             } else {
                 Logger::instance().warn("Accept error: " + ec.message());
             }

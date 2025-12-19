@@ -18,6 +18,8 @@ public:
 private:
     boost::asio::io_context ioc_;
     boost::asio::ip::tcp::acceptor acceptor_;
+    std::string address_;
+    unsigned short port_;
     std::shared_ptr<AuthService> auth_;
     std::shared_ptr<ScreenStreamManager> stream_manager_;
     std::shared_ptr<DiscoveryService> discovery_;
