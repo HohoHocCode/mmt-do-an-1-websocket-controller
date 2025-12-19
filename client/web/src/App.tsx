@@ -138,6 +138,7 @@ const createRequestId = () => {
   return `req-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 };
 const ACTION_TIMEOUT_MS = 20000;
+const STREAM_ACTION_TIMEOUT_MS = 3500;
 
 function formatTime(date: Date) {
   return date.toLocaleTimeString();
@@ -419,7 +420,13 @@ export default function App() {
   const isActionPending = (id: string, cmd: string) =>
     Boolean(pendingActionsRef.current[id]?.[cmd]);
 
-  const setPendingAction = (id: string, cmd: string, requestId: string, label?: string) => {
+  const setPendingAction = (
+    id: string,
+    cmd: string,
+    requestId: string,
+    label?: string,
+    timeoutMs: number = ACTION_TIMEOUT_MS
+  ) => {
     const key = pendingKey(id, cmd);
     if (pendingTimeoutsRef.current[key]) {
       clearTimeout(pendingTimeoutsRef.current[key]);
@@ -440,7 +447,7 @@ export default function App() {
       clearPendingAction(id, cmd);
       markError(id, `${label || cmd} timeout`);
       showToast({ text: `${label || cmd} timeout`, tone: "error" });
-    }, ACTION_TIMEOUT_MS);
+    }, timeoutMs);
   };
 
   const clearPendingAction = (id: string, cmd: string) => {
@@ -779,20 +786,24 @@ export default function App() {
           }
 
           // screen_stream frames
-        if (data.cmd === "screen_stream" && typeof data.image_base64 === "string") {
+          if (data.cmd === "screen_stream" && typeof data.image_base64 === "string") {
             const seq = typeof data.seq === "number" ? data.seq : undefined;
+            let updated = false;
             setTargets((inner) =>
-              inner.map((x) =>
-                x.id === id
-                  ? {
-                      ...x,
-                      lastImage: { kind: "screen_stream", base64: data.image_base64 as string, ts: Date.now(), seq },
-                      stream: { ...x.stream, running: true, lastSeq: typeof seq === "number" ? seq : x.stream.lastSeq },
-                    }
-                  : x
-              )
+              inner.map((x) => {
+                if (x.id !== id) return x;
+                if (!x.stream.running) return x;
+                updated = true;
+                return {
+                  ...x,
+                  lastImage: { kind: "screen_stream", base64: data.image_base64 as string, ts: Date.now(), seq },
+                  stream: { ...x.stream, running: true, lastSeq: typeof seq === "number" ? seq : x.stream.lastSeq },
+                };
+              })
             );
-            markRunning(id, "Streaming");
+            if (updated) {
+              markRunning(id, "Streaming");
+            }
             return;
           }
 
@@ -901,7 +912,12 @@ export default function App() {
     return { ...(payload as Record<string, unknown>), requestId };
   };
 
-  const sendJsonToTarget = (id: string, payload: unknown, label?: string) => {
+  const sendJsonToTarget = (
+    id: string,
+    payload: unknown,
+    label?: string,
+    options?: { timeoutMs?: number }
+  ) => {
     const cmd = extractCommand(payload);
     if (cmd && isActionPending(id, cmd)) {
       showToast({ text: `Action "${cmd}" is already running`, tone: "info" });
@@ -989,7 +1005,7 @@ export default function App() {
     }
 
     if (cmd && requestId) {
-      setPendingAction(id, cmd, requestId, label ?? cmd);
+      setPendingAction(id, cmd, requestId, label ?? cmd, options?.timeoutMs);
     }
     setTargets((prev) =>
       prev.map((t) =>
@@ -1007,7 +1023,11 @@ export default function App() {
     return true;
   };
 
-  const sendJson = (payload: unknown, label?: string, options?: { markRunning?: boolean }) => {
+  const sendJson = (
+    payload: unknown,
+    label?: string,
+    options?: { markRunning?: boolean; timeoutMs?: number }
+  ) => {
     const targetIds: string[] = [];
     if (broadcastMode) {
       if (selectedForBroadcast.length === 0) return;
@@ -1020,11 +1040,13 @@ export default function App() {
 
     if (broadcastMode) {
       targetIds.forEach((id) => {
-        const sent = sendJsonToTarget(id, payload, label ? `BROADCAST:${label}` : "BROADCAST");
+        const sent = sendJsonToTarget(id, payload, label ? `BROADCAST:${label}` : "BROADCAST", {
+          timeoutMs: options?.timeoutMs,
+        });
         if (sent) sentIds.push(id);
       });
     } else if (active) {
-      const sent = sendJsonToTarget(active.id, payload, label);
+      const sent = sendJsonToTarget(active.id, payload, label, { timeoutMs: options?.timeoutMs });
       if (sent) sentIds.push(active.id);
     }
 
@@ -1047,11 +1069,19 @@ export default function App() {
     const dur = Math.max(1, Math.min(60, streamDuration));
     const fps = Math.max(1, Math.min(30, streamFps));
     if (broadcastMode) {
-      sendJson({ cmd: "screen_stream", duration: dur, fps }, "screen_stream", { markRunning: true });
+      sendJson({ cmd: "screen_stream", duration: dur, fps }, "screen_stream", {
+        markRunning: true,
+        timeoutMs: STREAM_ACTION_TIMEOUT_MS,
+      });
       return;
     }
     if (!active) return;
-    const sent = sendJsonToTarget(active.id, { cmd: "screen_stream", duration: dur, fps }, "screen_stream");
+    const sent = sendJsonToTarget(
+      active.id,
+      { cmd: "screen_stream", duration: dur, fps },
+      "screen_stream",
+      { timeoutMs: STREAM_ACTION_TIMEOUT_MS }
+    );
     if (!sent) return;
     markRunning(active.id, "screen_stream");
     setTargets((prev) =>
@@ -1059,6 +1089,35 @@ export default function App() {
         t.id === active.id ? { ...t, stream: { ...t.stream, running: true, duration: dur, fps } } : t
       )
     );
+  };
+
+  const actionStopStream = () => {
+    const targetIds: string[] = [];
+    if (broadcastMode) {
+      if (selectedForBroadcast.length === 0) return;
+      targetIds.push(...selectedForBroadcast);
+    } else if (active) {
+      targetIds.push(active.id);
+    }
+
+    const sentIds: string[] = [];
+    targetIds.forEach((id) => {
+      const sent = sendJsonToTarget(id, { cmd: "cancel_all" }, "cancel_all", {
+        timeoutMs: STREAM_ACTION_TIMEOUT_MS,
+      });
+      if (sent) sentIds.push(id);
+    });
+
+    if (sentIds.length === 0) return;
+
+    setTargets((prev) =>
+      prev.map((t) =>
+        sentIds.includes(t.id)
+          ? { ...t, stream: { ...t.stream, running: false } }
+          : t
+      )
+    );
+    sentIds.forEach((id) => markRunning(id, "Stopping stream"));
   };
 
   const actionKillProcess = (pid: number) =>
@@ -1755,7 +1814,16 @@ export default function App() {
                                         bg-primary/20 transition text-sm
                                         ${actionsDisabled || isPendingForActive("screen_stream") || active.stream.running ? "opacity-50 cursor-not-allowed" : "hover:bg-primary/30"}`}
                             >
-                              <Send className="w-4 h-4" /> Stream
+                              <Send className="w-4 h-4" /> Start
+                            </button>
+                            <button
+                              onClick={actionStopStream}
+                              disabled={actionsDisabled || isPendingForActive("cancel_all") || !active.stream.running}
+                              className={`inline-flex items-center gap-2 px-2 py-1 rounded-md
+                                        bg-rose-500/10 text-rose-200 transition text-sm
+                                        ${actionsDisabled || isPendingForActive("cancel_all") || !active.stream.running ? "opacity-50 cursor-not-allowed" : "hover:bg-rose-500/20"}`}
+                            >
+                              <PowerOff className="w-4 h-4" /> Stop
                             </button>
                           </div>
                         </>
