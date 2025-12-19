@@ -86,6 +86,9 @@ export function AuthProvider({ children }: PropsWithChildren) {
       setLoading(true);
       try {
         const res = await apiLogin({ username, password });
+        if ("status" in res) {
+          throw new Error(res.status);
+        }
         setSession(res.token, res.user);
         localStorage.setItem("rdc.lastLoginAt", new Date().toISOString());
         localStorage.removeItem("rdc.lastLogoutAt");

@@ -191,18 +191,40 @@ private:
             const auto username = body.value("username", std::string{});
             const auto password = body.value("password", std::string{});
             auto login_result = auth_->login(username, password);
-            http::response<http::string_body> res{
-                login_result ? http::status::ok : http::status::unauthorized,
-                req.version()};
+            http::status status = http::status::internal_server_error;
+            Json resp;
+            switch (login_result.status) {
+                case LoginStatus::Ok:
+                    status = http::status::ok;
+                    resp["token"] = login_result.result->token;
+                    resp["user"] = {{"username", login_result.result->user.username},
+                                    {"role", login_result.result->user.role}};
+                    break;
+                case LoginStatus::NotFound:
+                    status = http::status::ok;
+                    resp["status"] = "not_found";
+                    break;
+                case LoginStatus::NeedsPasswordSet:
+                    status = http::status::ok;
+                    resp["status"] = "needs_password_set";
+                    break;
+                case LoginStatus::InvalidCredentials:
+                    status = http::status::unauthorized;
+                    resp["error"] = "invalid_credentials";
+                    break;
+                case LoginStatus::DbUnavailable:
+                    status = http::status::service_unavailable;
+                    resp["error"] = "db_unavailable";
+                    break;
+                case LoginStatus::Error:
+                default:
+                    status = http::status::internal_server_error;
+                    resp["error"] = "internal_error";
+                    break;
+            }
+            http::response<http::string_body> res{status, req.version()};
             res.set(http::field::content_type, "application/json");
             res.keep_alive(req.keep_alive());
-            Json resp;
-            if (login_result) {
-                resp["token"] = login_result->token;
-                resp["user"] = {{"username", login_result->user.username}, {"role", login_result->user.role}};
-            } else {
-                resp["error"] = "invalid_credentials";
-            }
             res.body() = resp.dump();
             res.prepare_payload();
             send(std::move(res));

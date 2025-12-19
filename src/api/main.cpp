@@ -94,7 +94,17 @@ int main(int argc, char* argv[]) {
 
         const ApiRuntimeConfig runtime = resolve_runtime_config(argc, argv);
 
-        ApiServer server(runtime.host, runtime.port, Database(cfg));
+        Logger::instance().info("DB config: host=" + cfg.host + " port=" + std::to_string(cfg.port) +
+                                " db=" + cfg.database);
+
+        Database database(cfg);
+        try {
+            database.connect();
+        } catch (const std::exception& e) {
+            Logger::instance().error(std::string("DB connection check failed: ") + e.what());
+        }
+
+        ApiServer server(runtime.host, runtime.port, std::move(database));
         server.run();
     } catch (const std::exception& e) {
         Logger::instance().error(std::string("API crashed: ") + e.what());
