@@ -8,6 +8,17 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Boost
 # ---------------------------------------------------------
 find_package(Boost CONFIG REQUIRED COMPONENTS system)
+find_package(Threads REQUIRED)
+find_package(OpenSSL REQUIRED)
+find_package(unofficial-mysql-connector-c CONFIG REQUIRED)
+
+if(WIN32)
+    set(PLATFORM_NETWORK_LIBS ws2_32 mswsock)
+    set(PLATFORM_PROCESS_LIBS psapi)
+else()
+    set(PLATFORM_NETWORK_LIBS)
+    set(PLATFORM_PROCESS_LIBS)
+endif()
 
 # ---------------------------------------------------------
 # OpenCV (from MSYS2 MinGW64)
@@ -55,6 +66,7 @@ target_link_libraries(modules PUBLIC
     opencv_imgproc
     opencv_highgui
     opencv_videoio
+    ${PLATFORM_PROCESS_LIBS}
 )
 
 # ---------------------------------------------------------
@@ -74,8 +86,7 @@ target_link_libraries(network
         core
         Boost::boost
         Boost::system
-        ws2_32
-        mswsock
+        ${PLATFORM_NETWORK_LIBS}
 )
 
 # ---------------------------------------------------------
@@ -90,8 +101,7 @@ target_link_libraries(server
         core
         network
         modules      # <<== ProcessManager + Dispatcher
-        ws2_32
-        mswsock
+        ${PLATFORM_NETWORK_LIBS}
 )
 
 # ---------------------------------------------------------
@@ -106,6 +116,45 @@ target_link_libraries(client
         core 
         network
         modules   
-        ws2_32
-        mswsock
+        ${PLATFORM_NETWORK_LIBS}
 )
+
+# ---------------------------------------------------------
+# API library (HTTP + services)
+# ---------------------------------------------------------
+add_library(api_lib
+    src/api/http_server.cpp
+    src/api/auth_service.cpp
+    src/api/db.cpp
+    src/api/password_hash.cpp
+    src/api/logger.cpp
+    src/api/stream_manager.cpp
+    src/api/discovery.cpp
+)
+
+target_include_directories(api_lib PUBLIC
+    ${CMAKE_SOURCE_DIR}/include
+)
+
+target_link_libraries(api_lib
+    PUBLIC
+        core
+        network
+        modules
+        Boost::boost
+        Boost::system
+        Threads::Threads
+        OpenSSL::Crypto
+        OpenSSL::SSL
+        unofficial::mysql-connector-c::mysqlclient
+        ${PLATFORM_NETWORK_LIBS}
+)
+
+# ---------------------------------------------------------
+# API executable
+# ---------------------------------------------------------
+add_executable(mmt_api
+    src/api/main.cpp
+)
+
+target_link_libraries(mmt_api PRIVATE api_lib)
