@@ -4,6 +4,8 @@
   "dependencies": [
     "boost-system",
     "opencv",
-    "libdatachannel"
+    "libdatachannel",
+    "openssl",
+    "unofficial-mysql-connector-c"
   ]
 }

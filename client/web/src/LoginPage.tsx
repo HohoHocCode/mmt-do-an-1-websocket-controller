@@ -14,7 +14,7 @@ import {
   CheckCircle,
   AlertTriangle,
 } from "lucide-react";
-import { getStatus, setPassword as apiSetPassword } from "./api";
+import { precheckUser, registerUser, setPassword as apiSetPassword } from "./api";
 import { useAuth } from "./auth";
 
 type Step = "username" | "login" | "setPassword" | "notFound";
@@ -56,7 +56,6 @@ export default function LoginPage({ appName, lockedReason }: Props) {
 
   const [username, setUsername] = useState(() => localStorage.getItem("rdc.lastUsername") || "");
   const [password, setPassword] = useState("");
-  const [setupToken, setSetupToken] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
 
@@ -80,7 +79,6 @@ export default function LoginPage({ appName, lockedReason }: Props) {
   const canLogin = usernameTrimmed.length >= 2 && password.trim().length >= 4 && !submitting && !authLoading;
   const canSetPassword =
     usernameTrimmed.length >= 2 &&
-    setupToken.trim().length >= 6 &&
     newPassword.trim().length >= 8 &&
     newPassword === confirmPassword &&
     !submitting;
@@ -99,13 +97,16 @@ export default function LoginPage({ appName, lockedReason }: Props) {
     setMessage(null);
     setChecking(true);
     try {
-      const res = await getStatus(usernameTrimmed);
+      const res = await precheckUser(usernameTrimmed);
       setStatus(res);
       if (!res.exists) setStep("notFound");
       else if (!res.hasPassword) setStep("setPassword");
       else setStep("login");
     } catch (e: any) {
       setError(e?.message || "Unable to check account status.");
+      // Allow manual login even if the precheck endpoint is unavailable.
+      setStep("login");
+      setStatus({ exists: true, hasPassword: true });
     } finally {
       setChecking(false);
     }
@@ -136,18 +137,36 @@ export default function LoginPage({ appName, lockedReason }: Props) {
     try {
       await apiSetPassword({
         username: usernameTrimmed,
-        setupToken: setupToken.trim(),
-        newPassword: newPassword.trim(),
+        password: newPassword.trim(),
       });
       setMessage("Password set. Please log in to continue.");
       setStep("login");
       setStatus((prevStatus) => prevStatus ? { ...prevStatus, hasPassword: true, exists: true } : { exists: true, hasPassword: true });
       setPassword(newPassword);
-      setSetupToken("");
       setNewPassword("");
       setConfirmPassword("");
     } catch (e: any) {
       setError(e?.message || "Failed to set password.");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleRegister = async () => {
+    if (!canCheck) return;
+    setSubmitting(true);
+    setError(null);
+    try {
+      const res = await registerUser({ username: usernameTrimmed });
+      if (!res.ok) {
+        setError(res.error || "Unable to register user.");
+      } else {
+        setStatus({ exists: true, hasPassword: false });
+        setStep("setPassword");
+        setMessage("Account created. Set your password to continue.");
+      }
+    } catch (e: any) {
+      setError(e?.message || "Unable to register.");
     } finally {
       setSubmitting(false);
     }
@@ -283,14 +302,8 @@ export default function LoginPage({ appName, lockedReason }: Props) {
                     First-time setup
                   </div>
                   <p className="text-xs text-blue-100/80">
-                    Enter the one-time setup token from your administrator and choose your password.
+                    Choose a strong password to activate your operator account.
                   </p>
-                  <input
-                    value={setupToken}
-                    onChange={(e) => setSetupToken(e.target.value)}
-                    placeholder="Setup token"
-                    className="w-full rounded-lg border border-slate-700 bg-slate-950/60 px-3 py-2 text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-primary/60"
-                  />
                   <input
                     type="password"
                     value={newPassword}
@@ -342,9 +355,20 @@ export default function LoginPage({ appName, lockedReason }: Props) {
               ) : null}
 
               {showNotFound ? (
-                <div className="rounded-xl border border-amber-500/40 bg-amber-500/10 px-3 py-3 text-sm text-amber-100 flex gap-2 items-center">
-                  <AlertTriangle className="h-4 w-4" />
-                  Account not found. Contact an administrator to be invited.
+                <div className="space-y-3">
+                  <div className="rounded-xl border border-amber-500/40 bg-amber-500/10 px-3 py-3 text-sm text-amber-100 flex gap-2 items-center">
+                    <AlertTriangle className="h-4 w-4" />
+                    Account not found. You can request a new operator account.
+                  </div>
+                  <button
+                    type="button"
+                    disabled={!canCheck || submitting}
+                    onClick={handleRegister}
+                    className="w-full inline-flex items-center justify-center gap-2 rounded-lg bg-slate-800 px-3 py-2 text-sm font-semibold text-slate-100 hover:bg-slate-700 disabled:opacity-60"
+                  >
+                    {submitting ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle className="h-4 w-4" />}
+                    Create account
+                  </button>
                 </div>
               ) : null}
 
