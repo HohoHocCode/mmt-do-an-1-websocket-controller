@@ -337,14 +337,9 @@ private:
     static constexpr std::size_t max_pending_jobs_ = 32;
     std::unordered_set<std::string> inflight_cmds_;
 
-    struct PendingMessage {
-        std::shared_ptr<std::string> payload;
-        bool is_stream_frame = false;
-        std::function<void(const beast::error_code&)> on_complete;
-    };
-
-    std::deque<PendingMessage> send_queue_;
+    std::deque<std::shared_ptr<std::string>> outbox_;
     bool write_in_progress_ = false;
+    static constexpr std::size_t max_stream_backlog_ = 5;
 
     // Stream state
     asio::steady_timer stream_timer_;
@@ -426,8 +421,7 @@ private:
             Json ack;
             ack["cmd"] = "screen_stream";
             if (!start_screen_stream(duration, fps)) {
-                ack["status"] = "error";
-                ack["message"] = "already_streaming";
+                ack["status"] = "already_running";
             } else {
                 ack["status"] = "started";
                 ack["duration"] = duration;
@@ -617,51 +611,54 @@ private:
 
     // ------------------------------------------------------------------------
     void send_text(const std::string& s) {
-        enqueue_send(s, false, nullptr);
+        enqueue_write(std::make_shared<std::string>(s), false);
     }
 
-    void enqueue_send(
-        const std::string& s,
-        bool is_stream_frame,
-        std::function<void(const beast::error_code&)> on_complete
-    ) {
-        auto msg = std::make_shared<std::string>(s);
-        send_queue_.push_back(PendingMessage{msg, is_stream_frame, std::move(on_complete)});
-        if (!write_in_progress_) {
-            write_in_progress_ = true;
-            do_write();
-        }
-    }
-
-    void do_write() {
-        if (send_queue_.empty()) {
-            write_in_progress_ = false;
-            return;
-        }
-
-        auto msg = send_queue_.front().payload;
-        auto on_complete = send_queue_.front().on_complete;
-        ws_.text(true);
-        ws_.async_write(
-            asio::buffer(*msg),
-            [self = shared_from_this(), msg, on_complete](beast::error_code ec, std::size_t) {
-                if (on_complete) {
-                    on_complete(ec);
+    void enqueue_write(std::shared_ptr<std::string> msg, bool drop_if_busy = false) {
+        asio::dispatch(
+            strand_,
+            [self = shared_from_this(), msg = std::move(msg), drop_if_busy]() mutable {
+                if (drop_if_busy && self->outbox_.size() >= max_stream_backlog_) {
+                    return;
                 }
-                self->on_write(ec);
+                self->outbox_.push_back(std::move(msg));
+                if (!self->write_in_progress_) {
+                    self->write_in_progress_ = true;
+                    self->do_write();
+                }
             }
         );
     }
 
-    void on_write(const beast::error_code& ec) {
-        if (send_queue_.empty()) {
+    void do_write() {
+        if (outbox_.empty()) {
             write_in_progress_ = false;
             return;
         }
-        send_queue_.pop_front();
+
+        auto msg = outbox_.front();
+        ws_.text(true);
+        ws_.async_write(
+            asio::buffer(*msg),
+            asio::bind_executor(
+                strand_,
+                [self = shared_from_this(), msg](beast::error_code ec, std::size_t) {
+                    self->on_write(ec);
+                }
+            )
+        );
+    }
+
+    void on_write(const beast::error_code& ec) {
+        if (outbox_.empty()) {
+            write_in_progress_ = false;
+            return;
+        }
         if (ec) {
             std::cerr << "[WsServer] Write error: " << ec.message() << "\n";
+            stop_stream("write_failed");
         }
+        outbox_.pop_front();
         do_write();
     }
 
@@ -707,19 +704,11 @@ private:
 
     // ------------------------------------------------------------------------
     void stop_stream(const std::string& reason) {
-        if (!streaming_) return;
         streaming_ = false;
         stream_generation_++;
         beast::error_code cancel_ec;
         stream_timer_.cancel(cancel_ec);
         stream_guard_timer_.cancel(cancel_ec);
-        for (auto it = send_queue_.begin(); it != send_queue_.end();) {
-            if (it->is_stream_frame) {
-                it = send_queue_.erase(it);
-            } else {
-                ++it;
-            }
-        }
         std::cout << "[WsServer] Stream stopped (" << reason << ")\n";
     }
 
@@ -740,34 +729,26 @@ private:
             stop_stream("capture_failed");
             return;
         }
+        if (!streaming_ || generation != stream_generation_) return;
 
         Json j;
         j["cmd"] = "screen_stream";
         j["seq"] = stream_seq_;
         j["image_base64"] = b64;
 
-        enqueue_send(
-            j.dump(),
-            true,
-            [self = shared_from_this(), generation](const beast::error_code& write_ec) {
-                if (write_ec) {
-                    self->stop_stream("write_failed");
-                    return;
-                }
+        if (outbox_.size() < max_stream_backlog_) {
+            enqueue_write(std::make_shared<std::string>(j.dump()), true);
+        }
 
-                if (!self->streaming_ || generation != self->stream_generation_) return;
+        if (!streaming_ || generation != stream_generation_) return;
 
-                self->stream_seq_++;
-
-                self->stream_timer_.expires_after(
-                    std::chrono::milliseconds(self->stream_interval_ms_)
-                );
-
-                self->stream_timer_.async_wait(
-                    [self, generation](const beast::error_code& timer_ec) {
-                        self->do_stream_frame(timer_ec, generation);
-                    }
-                );
+        stream_seq_++;
+        stream_timer_.expires_after(
+            std::chrono::milliseconds(stream_interval_ms_)
+        );
+        stream_timer_.async_wait(
+            [self = shared_from_this(), generation](const beast::error_code& timer_ec) {
+                self->do_stream_frame(timer_ec, generation);
             }
         );
     }
