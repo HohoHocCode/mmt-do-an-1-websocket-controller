@@ -19,3 +19,17 @@ export interface SystemInfo {
   totalMemory: number;
   availableMemory: number;
 }
+
+export type Role = 'admin' | 'user';
+
+export interface AuthUser {
+  username: string;
+  role: Role;
+}
+
+export interface DiscoveryDevice {
+  name?: string;
+  ip?: string;
+  wsPort?: number | null;
+  version?: string;
+}

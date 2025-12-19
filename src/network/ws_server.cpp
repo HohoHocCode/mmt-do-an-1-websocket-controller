@@ -2,21 +2,138 @@
 #include "core/dispatcher.hpp"
 #include "utils/json.hpp"
 #include "modules/screen.hpp"
+#include "modules/system_control.hpp"
 
 #include <boost/asio.hpp>
 #include <boost/beast/core.hpp>
+#include <boost/beast/http.hpp>
 #include <boost/beast/websocket.hpp>
 
 #include <iostream>
 #include <memory>
 #include <string>
 #include <chrono>
+#include <optional>
+#include <cstdlib>
 
 namespace asio  = boost::asio;
 namespace beast = boost::beast;
+namespace http  = beast::http;
 namespace ws    = beast::websocket;
 using tcp       = asio::ip::tcp;
 
+struct ParsedUrl {
+    std::string host = "localhost";
+    std::string port = "80";
+    std::string base_path;
+};
+
+struct VerifiedUser {
+    std::string username;
+    std::string role;
+};
+
+static ParsedUrl parse_base_url(const std::string& url) {
+    ParsedUrl result;
+    std::string working = url;
+    const std::string prefix = "http://";
+    if (working.rfind(prefix, 0) == 0) {
+        working = working.substr(prefix.size());
+    }
+
+    auto slash_pos = working.find('/');
+    std::string host_port = slash_pos == std::string::npos ? working : working.substr(0, slash_pos);
+    std::string path = slash_pos == std::string::npos ? "" : working.substr(slash_pos);
+
+    auto colon_pos = host_port.find(':');
+    if (colon_pos != std::string::npos) {
+        result.host = host_port.substr(0, colon_pos);
+        result.port = host_port.substr(colon_pos + 1);
+    } else {
+        result.host = host_port;
+        result.port = "80";
+    }
+
+    if (!path.empty() && path.front() != '/') path = "/" + path;
+    result.base_path = path;
+    return result;
+}
+
+static std::optional<VerifiedUser> verify_with_auth_service(const std::string& base_url, const std::string& token) {
+    try {
+        auto parsed = parse_base_url(base_url);
+        asio::io_context ioc;
+        tcp::resolver resolver(ioc);
+        auto results = resolver.resolve(parsed.host, parsed.port);
+        beast::tcp_stream stream(ioc);
+        stream.connect(results);
+
+        std::string target = parsed.base_path + "/auth/verify";
+        if (target.empty() || target.front() != '/') target = "/" + target;
+
+        http::request<http::string_body> req{http::verb::post, target, 11};
+        req.set(http::field::host, parsed.host);
+        req.set(http::field::content_type, "application/json");
+        req.body() = Json({{"token", token}}).dump();
+        req.prepare_payload();
+
+        http::write(stream, req);
+        beast::flat_buffer buffer;
+        http::response<http::string_body> res;
+        http::read(stream, buffer, res);
+
+        beast::error_code ec;
+        stream.socket().shutdown(tcp::socket::shutdown_both, ec);
+
+        if (res.result() != http::status::ok) return std::nullopt;
+        Json body = Json::parse(res.body());
+        if (body.contains("ok") && body["ok"] == true && body.contains("user")) {
+            auto user = body["user"];
+            if (user.contains("username") && user.contains("role")) {
+                return VerifiedUser{user["username"], user["role"]};
+            }
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "[Auth] verify error: " << e.what() << "\n";
+    }
+    return std::nullopt;
+}
+
+static void send_audit_remote(const std::string& base_url, const std::string& token, const std::string& action, const Json& meta) {
+    try {
+        auto parsed = parse_base_url(base_url);
+        asio::io_context ioc;
+        tcp::resolver resolver(ioc);
+        auto results = resolver.resolve(parsed.host, parsed.port);
+        beast::tcp_stream stream(ioc);
+        stream.connect(results);
+
+        std::string target = parsed.base_path + "/audit";
+        if (target.empty() || target.front() != '/') target = "/" + target;
+
+        Json payload;
+        payload["action"] = action;
+        payload["meta"] = meta;
+
+        http::request<http::string_body> req{http::verb::post, target, 11};
+        req.set(http::field::host, parsed.host);
+        req.set(http::field::content_type, "application/json");
+        req.set(http::field::authorization, "Bearer " + token);
+        req.body() = payload.dump();
+        req.prepare_payload();
+
+        http::write(stream, req);
+        beast::flat_buffer buffer;
+        http::response<http::string_body> res;
+        http::read(stream, buffer, res);
+
+        beast::error_code ec;
+        stream.socket().shutdown(tcp::socket::shutdown_both, ec);
+        (void)res;
+    } catch (const std::exception& e) {
+        std::cerr << "[Audit] send failed: " << e.what() << "\n";
+    }
+}
 
 // ============================================================================
 // WebSocketSession
@@ -26,6 +143,7 @@ public:
     explicit WebSocketSession(tcp::socket socket)
         : ws_(std::move(socket))
         , stream_timer_(ws_.get_executor())   // timer dùng chung executor với websocket
+        , auth_api_base_(std::getenv("AUTH_API_URL") ? std::getenv("AUTH_API_URL") : "http://localhost:5179")
     {}
 
     void start() {
@@ -44,6 +162,9 @@ private:
 
     beast::flat_buffer buffer_;
     Dispatcher dispatcher_;
+    std::optional<VerifiedUser> verified_user_;
+    std::string auth_token_;
+    std::string auth_api_base_;
 
     // Stream state
     asio::steady_timer stream_timer_;
@@ -91,8 +212,74 @@ private:
         try {
             Json j = Json::parse(req);
             if (j.contains("cmd") && j["cmd"].is_string()) {
+                std::string cmd = j["cmd"];
 
-                if (j["cmd"] == "screen_stream") {
+                if (cmd == "auth") {
+                    Json resp;
+                    resp["cmd"] = "auth";
+                    if (!j.contains("token") || !j["token"].is_string()) {
+                        resp["status"] = "error";
+                        resp["message"] = "token required";
+                    } else {
+                        std::string incoming_token = j["token"];
+                        auto verified = verify_with_auth_service(auth_api_base_, incoming_token);
+                        if (verified) {
+                            verified_user_ = verified;
+                            auth_token_ = incoming_token;
+                            resp["status"] = "ok";
+                            resp["username"] = verified->username;
+                            resp["role"] = verified->role;
+                        } else {
+                            verified_user_.reset();
+                            auth_token_.clear();
+                            resp["status"] = "error";
+                            resp["message"] = "Invalid token";
+                        }
+                    }
+                    send_text(resp.dump());
+                    do_read();
+                    return;
+                }
+
+                if (cmd == "restart" || cmd == "shutdown") {
+                    Json resp;
+                    resp["cmd"] = cmd;
+                    if (!verified_user_ || verified_user_->role != "admin") {
+                        resp["status"] = "error";
+                        resp["message"] = "admin_token_required";
+                        send_text(resp.dump());
+                        do_read();
+                        return;
+                    }
+                    SystemControl control;
+                    bool ok = cmd == "shutdown" ? control.shutdown() : control.restart();
+                    resp["status"] = ok ? "accepted" : "error";
+                    if (!ok) resp["message"] = "not_supported";
+
+                    if (ok && !auth_token_.empty()) {
+                        Json meta;
+                        meta["cmd"] = cmd;
+                        send_audit_remote(auth_api_base_, auth_token_, cmd, meta);
+                    }
+
+                    send_text(resp.dump());
+                    do_read();
+                    return;
+                }
+
+                if (cmd == "cancel_all") {
+                    streaming_ = false;
+                    beast::error_code cancel_ec;
+                    stream_timer_.cancel(cancel_ec);
+                    Json ack;
+                    ack["cmd"] = "cancel_all";
+                    ack["status"] = "ok";
+                    send_text(ack.dump());
+                    do_read();
+                    return;
+                }
+
+                if (cmd == "screen_stream") {
                     int duration = j.value("duration", 5);
                     int fps = j.value("fps", 5);
 
