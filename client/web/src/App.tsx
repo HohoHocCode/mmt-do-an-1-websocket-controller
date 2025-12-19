@@ -4,24 +4,33 @@ import {
   Activity,
   Camera,
   Check,
+  ChevronDown,
   Cpu,
   Download,
   Film,
   Image as ImageIcon,
+  Loader2,
+  Lock,
   Monitor,
   Plus,
+  Power,
   RadioTower,
   RefreshCw,
+  Search,
   Send,
+  Shield,
   Trash2,
   Video,
   Wifi,
   XCircle,
 } from "lucide-react";
 import LoginPage from "./LoginPage";
+import { useAuth } from "./auth";
+import { logAudit, discoverDevices, ApiError } from "./api";
+import type { AuthUser, DiscoveryDevice } from "./types";
 
 // [ADDED] App name (để LoginPage / Header dùng thống nhất)
-const APP_NAME = "REMOTE DESKTOP CONTROL"; // [ADDED]
+const APP_NAME = import.meta.env.VITE_APP_NAME || "Remote Desktop Control"; // [ADDED]
 
 // Commands (JSON over WebSocket):
 //   {"cmd":"ping"}
@@ -78,6 +87,8 @@ interface RemoteTarget {
   connected: boolean;
   connecting: boolean;
   ws?: WebSocket;
+  authStatus?: "idle" | "ok" | "failed";
+  authUser?: AuthUser | null;
 
   logs: Log[];
   processes: Proc[];
@@ -154,6 +165,7 @@ function safeSend(ws: WebSocket | undefined, raw: string) {
 const LOG_LIMIT = 400;
 
 export default function App() {
+  const { user, token, locked, lockedReason, lockSession } = useAuth();
   const [targets, setTargets] = useState<RemoteTarget[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
 
@@ -174,11 +186,15 @@ export default function App() {
   const [streamFps, setStreamFps] = useState(5);
 
   const logsEndRef = useRef<HTMLDivElement | null>(null);
-  const [uiLoggedIn, setUiLoggedIn] = useState(false);
-  const [username, setUsername] = useState("");
-
-  // [ADDED] password state cho LoginPage
-  const [password, setPassword] = useState(""); // [ADDED]
+  const [discovering, setDiscovering] = useState(false);
+  const [discoveredDevices, setDiscoveredDevices] = useState<DiscoveryDevice[]>([]);
+  const [discoverError, setDiscoverError] = useState<string | null>(null);
+  const [powerMenuOpen, setPowerMenuOpen] = useState(false);
+  const [confirmAction, setConfirmAction] = useState<{
+    action: "restart" | "shutdown" | "reset" | null;
+    code: string;
+  }>({ action: null, code: "" });
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
 
   const active = useMemo(
     () => targets.find((t) => t.id === activeId) ?? targets[0] ?? null,
@@ -193,7 +209,7 @@ export default function App() {
     setStreamFps(active.stream.fps);
   }, [active?.id]);
 
-  const canSend = !!active?.connected;
+  const canSend = !!active?.connected && !!token && !locked;
 
   useEffect(() => {
     if (!activeId && targets.length > 0) setActiveId(targets[0].id);
@@ -242,24 +258,18 @@ export default function App() {
     );
   };
 
-  // [CHANGED] handleLogin thêm validate password (giữ logic cũ)
-  const handleLogin = () => {
-    const u = username.trim();
-    const p = password.trim(); // [ADDED]
-    if (!u) return;
+  const showToast = (msg: string) => {
+    setToastMessage(msg);
+    setTimeout(() => setToastMessage(null), 2800);
+  };
 
-    // [ADDED] validate password tối thiểu
-    if (!p) return; // [ADDED]
-    if (p.length < 4) return; // [ADDED]
-
-    localStorage.setItem("rdc.lastUsername", u);
-    localStorage.setItem("rdc.lastLoginAt", new Date().toISOString());
-    localStorage.removeItem("rdc.lastLogoutAt");
-
-    setUiLoggedIn(true);
-
-    // [ADDED] khuyến nghị: không giữ password trong state sau khi login
-    setPassword(""); // [ADDED]
+  const recordAudit = async (action: string, meta: Record<string, unknown> = {}) => {
+    if (!token) return;
+    try {
+      await logAudit(token, action, meta);
+    } catch (err) {
+      console.warn("Failed to log audit", err);
+    }
   };
 
   const handleAddTarget = () => {
@@ -278,6 +288,8 @@ export default function App() {
       connecting: false,
       logs: [],
       processes: [],
+      authStatus: "idle",
+      authUser: null,
       stream: { running: false, fps: 5, duration: 5, lastSeq: -1 },
     };
 
@@ -286,6 +298,35 @@ export default function App() {
     setNewHost("");
     setNewPort(String(DEFAULT_PORT));
     if (!activeId) setActiveId(id);
+  };
+
+  const handleAddDiscovered = (device: DiscoveryDevice) => {
+    const host = device.ip || "";
+    if (!host) return;
+    setNewHost(host);
+    setNewPort(String(device.wsPort || DEFAULT_PORT));
+    setNewName(device.name || host);
+    showToast("Device info loaded. Click Add to connect.");
+  };
+
+  const handleDiscoverDevices = async () => {
+    if (!token) return;
+    setDiscovering(true);
+    setDiscoverError(null);
+    try {
+      const res = await discoverDevices(token);
+      const list = res.devices || [];
+      setDiscoveredDevices(list as DiscoveryDevice[]);
+      await recordAudit("discover_devices", { found: list.length });
+      if (!list.length) {
+        setDiscoverError("No agents responded to discovery broadcast. Ensure UDP port 41000 is open.");
+      }
+    } catch (err) {
+      const msg = err instanceof ApiError ? err.message : "Discovery failed";
+      setDiscoverError(msg);
+    } finally {
+      setDiscovering(false);
+    }
   };
 
   const disconnectTarget = (id: string) => {
@@ -323,7 +364,16 @@ export default function App() {
 
         ws.onopen = () => {
           addLog(id, "WebSocket connected", "success");
-          setTargets((inner) => inner.map((x) => (x.id === id ? { ...x, connected: true, connecting: false } : x)));
+          setTargets((inner) =>
+            inner.map((x) =>
+              x.id === id
+                ? { ...x, connected: true, connecting: false, authStatus: token ? "idle" : "failed" }
+                : x
+            )
+          );
+          if (token) {
+            safeSend(ws, JSON.stringify({ cmd: "auth", token }));
+          }
           // ping an toàn
           safeSend(ws, JSON.stringify({ cmd: "ping" }));
         };
@@ -349,6 +399,8 @@ export default function App() {
                 ws: undefined,
                 lastVideo: x.lastVideo ? { ...x.lastVideo, url: undefined } : undefined,
                 stream: { ...x.stream, running: false },
+                authStatus: "idle",
+                authUser: null,
               };
             })
           );
@@ -361,6 +413,25 @@ export default function App() {
             return;
           }
           const data = parsed as Record<string, unknown>;
+
+          if (data.cmd === "auth") {
+            const status = typeof data.status === "string" ? data.status : "error";
+            const info: AuthUser | null =
+              status === "ok" && typeof data.username === "string" && typeof data.role === "string"
+                ? { username: data.username as string, role: data.role as AuthUser["role"] }
+                : null;
+            setTargets((inner) =>
+              inner.map((x) =>
+                x.id === id ? { ...x, authStatus: status === "ok" ? "ok" : "failed", authUser: info } : x
+              )
+            );
+            addLog(
+              id,
+              status === "ok" ? `Session authenticated as ${info?.username}` : `Auth failed: ${data.message || "invalid"}`,
+              status === "ok" ? "success" : "error"
+            );
+            return;
+          }
 
           // screen_stream frames
           if (data.cmd === "screen_stream" && typeof data.image_base64 === "string") {
@@ -467,10 +538,31 @@ export default function App() {
     setTargets((prev) =>
       prev.map((t) => {
         if (t.id !== id) return t;
+        if (locked) {
+            return {
+              ...t,
+              logs: [
+                ...t.logs,
+                { text: "Session locked. Please sign in again to run actions.", type: "error" as LogType, timestamp: new Date() },
+              ].slice(-LOG_LIMIT),
+            };
+        }
+        if (!token) {
+          return {
+            ...t,
+            logs: [
+              ...t.logs,
+              { text: "Missing auth token. Please login again.", type: "error" as LogType, timestamp: new Date() },
+            ].slice(-LOG_LIMIT),
+          };
+        }
         if (!t.ws || t.ws.readyState !== WebSocket.OPEN) {
           return {
             ...t,
-            logs: [...t.logs, { text: "Cannot send: not connected", type: "error", timestamp: new Date() }].slice(-LOG_LIMIT),
+            logs: [
+              ...t.logs,
+              { text: "Cannot send: not connected", type: "error" as LogType, timestamp: new Date() },
+            ].slice(-LOG_LIMIT),
           };
         }
         const raw = JSON.stringify(payload);
@@ -480,13 +572,19 @@ export default function App() {
         if (!ok) {
           return {
             ...t,
-            logs: [...t.logs, { text: "Send failed (socket not open)", type: "error", timestamp: new Date() }].slice(-LOG_LIMIT),
+            logs: [
+              ...t.logs,
+              { text: "Send failed (socket not open)", type: "error" as LogType, timestamp: new Date() },
+            ].slice(-LOG_LIMIT),
           };
         }
 
         return {
           ...t,
-          logs: [...t.logs, { text: label ? `$ ${label}  ${raw}` : `$ ${raw}`, type: "command", timestamp: new Date() }].slice(-LOG_LIMIT),
+          logs: [
+            ...t.logs,
+            { text: label ? `$ ${label}  ${raw}` : `$ ${raw}`, type: "command" as LogType, timestamp: new Date() },
+          ].slice(-LOG_LIMIT),
         };
       })
     );
@@ -530,6 +628,39 @@ export default function App() {
     setStartPath("");
   };
 
+  const handleResetTasks = () => {
+    sendJson({ cmd: "cancel_all" }, "cancel_all");
+    setTargets((prev) => prev.map((t) => ({ ...t, stream: { ...t.stream, running: false } })));
+    showToast("Reset done");
+    recordAudit("reset", { target: active?.host ?? "broadcast" });
+  };
+
+  const requestPowerAction = (action: "restart" | "shutdown" | "reset") => {
+    if (action === "reset") {
+      handleResetTasks();
+      return;
+    }
+    setConfirmAction({ action, code: "" });
+    setPowerMenuOpen(false);
+  };
+
+  const confirmPowerAction = () => {
+    if (!confirmAction.action) return;
+    const keyword = confirmAction.action === "restart" ? "RESTART" : "SHUTDOWN";
+    if (confirmAction.code.toUpperCase() !== keyword) {
+      showToast(`Type ${keyword} to confirm.`);
+      return;
+    }
+    if (user?.role !== "admin") {
+      showToast("Administrator role required.");
+      setConfirmAction({ action: null, code: "" });
+      return;
+    }
+    sendJson({ cmd: confirmAction.action, token }, confirmAction.action);
+    recordAudit(confirmAction.action, { target: active?.host ?? "broadcast" });
+    setConfirmAction({ action: null, code: "" });
+  };
+
   const actionSendCustomJson = () => {
     const parsed = safeJsonParse(customCmd);
     if (!parsed) {
@@ -553,20 +684,12 @@ export default function App() {
     if (activeId === id) setActiveId(null);
   };
 
-  if (!uiLoggedIn) {
-    return (
-      <LoginPage
-        appName={APP_NAME} // [CHANGED] (hoặc bạn giữ "Remote Control Center" cũng được)
-        username={username}
-        password={password} // [ADDED]
-        onUsernameChange={setUsername}
-        onPasswordChange={setPassword} // [ADDED]
-        onSubmit={handleLogin}
-      />
-    );
+  if (!token || !user || locked) {
+    return <LoginPage appName={APP_NAME} lockedReason={lockedReason} />;
   }
 
   return (
+    <>
     <div className="min-h-screen bg-[#040A18] text-slate-100 p-4 md:p-6 relative overflow-hidden">
       <div className="pointer-events-none absolute inset-0">
         <div className="absolute -top-56 -left-40 h-[680px] w-[680px] rounded-full bg-blue-600/20 blur-3xl" />
@@ -574,6 +697,66 @@ export default function App() {
       </div>
       <div className="max-w-7xl mx-auto flex flex-col gap-4 h-[calc(100vh-2rem)]">
         <Header title="Remote Control Center" connectedCount={targets.filter((t) => t.connected).length} />
+
+        <div className="bg-secondary/40 border border-border rounded-2xl px-4 py-3 shadow-lg flex flex-wrap items-center gap-3 justify-between">
+          <div className="flex items-center gap-3">
+            <div className="inline-flex items-center gap-2 rounded-full border border-border bg-slate-900/50 px-3 py-1.5 text-xs">
+              <Shield className="w-4 h-4 text-primary" />
+              <span className="font-semibold text-slate-50">{user.username}</span>
+              <span className="text-[10px] uppercase tracking-wide text-slate-300 bg-slate-800 px-2 py-0.5 rounded-full">
+                {user.role}
+              </span>
+            </div>
+            <div className="inline-flex items-center gap-2 text-xs text-muted-foreground">
+              <Wifi className="w-4 h-4 text-emerald-300" /> {targets.filter((t) => t.connected).length} connected
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => {
+                recordAudit("lock", { source: "ui" });
+                lockSession("Session locked. Sign in to continue.");
+              }}
+              className="inline-flex items-center gap-2 px-3 py-2 rounded-lg bg-slate-900/60 border border-border text-sm hover:bg-slate-800"
+            >
+              <Lock className="w-4 h-4" /> Lock session
+            </button>
+
+            <div className="relative">
+              <button
+                onClick={() => setPowerMenuOpen((v) => !v)}
+                className="inline-flex items-center gap-2 px-3 py-2 rounded-lg bg-primary text-sm font-semibold text-slate-50 shadow-lg"
+              >
+                <Power className="w-4 h-4" /> Power <ChevronDown className="w-4 h-4" />
+              </button>
+              {powerMenuOpen ? (
+                <div className="absolute right-0 mt-2 w-48 rounded-xl border border-border bg-slate-900/90 shadow-xl z-10">
+                  <button
+                    onClick={() => requestPowerAction("restart")}
+                    className="w-full px-3 py-2 text-left text-sm hover:bg-slate-800 flex items-center gap-2 disabled:opacity-60"
+                    disabled={user.role !== "admin"}
+                  >
+                    <RefreshCw className="w-4 h-4" /> Restart (admin)
+                  </button>
+                  <button
+                    onClick={() => requestPowerAction("shutdown")}
+                    className="w-full px-3 py-2 text-left text-sm hover:bg-slate-800 flex items-center gap-2 disabled:opacity-60"
+                    disabled={user.role !== "admin"}
+                  >
+                    <Power className="w-4 h-4" /> Shutdown (admin)
+                  </button>
+                  <button
+                    onClick={() => requestPowerAction("reset")}
+                    className="w-full px-3 py-2 text-left text-sm hover:bg-slate-800 flex items-center gap-2"
+                  >
+                    <RefreshCw className="w-4 h-4" /> Reset tasks
+                  </button>
+                </div>
+              ) : null}
+            </div>
+          </div>
+        </div>
 
         <div className="flex-1 flex flex-col md:flex-row gap-4 min-h-0">
           {/* Sidebar */}
@@ -610,6 +793,52 @@ export default function App() {
               >
                 <Plus className="w-4 h-4" /> Add
               </button>
+            </div>
+
+            {/* Discovery */}
+            <div className="bg-secondary/50 border border-border rounded-2xl p-4 space-y-3 shadow-lg">
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <Search className="w-4 h-4 text-primary" />
+                  <span className="text-sm font-medium">Discover devices</span>
+                </div>
+                <button
+                  onClick={handleDiscoverDevices}
+                  disabled={discovering}
+                  className="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg bg-slate-900/70 border border-border text-xs hover:bg-slate-800 disabled:opacity-50"
+                >
+                  {discovering ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
+                  Scan
+                </button>
+              </div>
+              {discoverError ? <p className="text-[11px] text-amber-200">{discoverError}</p> : null}
+              <div className="space-y-2 max-h-32 overflow-auto pr-1">
+                {discoveredDevices.length === 0 ? (
+                  <p className="text-xs text-muted-foreground">No responses yet.</p>
+                ) : (
+                  discoveredDevices.map((d, idx) => (
+                    <div key={`${d.ip}-${idx}`} className="rounded-lg border border-border bg-slate-900/60 p-2 text-xs">
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="min-w-0">
+                          <p className="font-semibold truncate">{d.name || d.ip || "Unknown"}</p>
+                          <p className="text-[11px] text-muted-foreground truncate">
+                            {d.ip}:{d.wsPort || DEFAULT_PORT} {d.version ? `· v${d.version}` : ""}
+                          </p>
+                        </div>
+                        <button
+                          onClick={() => handleAddDiscovered(d)}
+                          className="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-primary/20 text-[11px] hover:bg-primary/30"
+                        >
+                          Use
+                        </button>
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
+              <p className="text-[11px] text-muted-foreground">
+                Broadcasts on UDP 41000 only. No port scans performed.
+              </p>
             </div>
 
             {/* Broadcast */}
@@ -680,6 +909,16 @@ export default function App() {
                           <p className="text-[11px] text-muted-foreground truncate mt-1">
                             {t.host}:{t.port}
                           </p>
+                          <div className="flex items-center gap-1 text-[10px] text-muted-foreground mt-1">
+                            <Shield className="w-3 h-3 text-slate-400" />
+                            {t.authStatus === "ok" ? (
+                              <span className="text-emerald-200">Token verified</span>
+                            ) : t.authStatus === "failed" ? (
+                              <span className="text-rose-200">Auth failed</span>
+                            ) : (
+                              <span>Awaiting auth</span>
+                            )}
+                          </div>
                         </div>
 
                         <div className="flex items-center gap-1.5">
@@ -1100,5 +1339,48 @@ export default function App() {
         </div>
       </div>
     </div>
+
+    {confirmAction.action ? (
+      <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-20 px-4">
+        <div className="w-full max-w-sm rounded-2xl bg-slate-900 border border-border p-5 space-y-3 shadow-2xl">
+          <div className="flex items-center gap-2">
+            <Power className="w-5 h-5 text-primary" />
+            <div>
+              <p className="text-lg font-semibold text-slate-50">Confirm {confirmAction.action}</p>
+              <p className="text-xs text-muted-foreground">
+                Type {confirmAction.action === "restart" ? "RESTART" : "SHUTDOWN"} to continue. Admin only.
+              </p>
+            </div>
+          </div>
+          <input
+            value={confirmAction.code}
+            onChange={(e) => setConfirmAction((prev) => ({ ...prev, code: e.target.value }))}
+            className="w-full rounded-lg border border-border bg-slate-950/60 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary/60"
+            placeholder="Type keyword to confirm"
+          />
+          <div className="flex items-center justify-end gap-2">
+            <button
+              onClick={() => setConfirmAction({ action: null, code: "" })}
+              className="px-3 py-2 rounded-lg border border-border text-sm hover:bg-slate-800"
+            >
+              Cancel
+            </button>
+            <button
+              onClick={confirmPowerAction}
+              className="px-3 py-2 rounded-lg bg-primary text-sm font-semibold text-slate-50 hover:opacity-90"
+            >
+              Confirm
+            </button>
+          </div>
+        </div>
+      </div>
+    ) : null}
+
+    {toastMessage ? (
+      <div className="fixed bottom-6 right-6 z-30 rounded-lg border border-emerald-400/40 bg-emerald-500/20 px-4 py-2 text-sm text-emerald-100 shadow-lg">
+        {toastMessage}
+      </div>
+    ) : null}
+    </>
   );
 }
