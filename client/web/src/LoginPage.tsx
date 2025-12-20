@@ -77,8 +77,7 @@ export default function LoginPage({ appName, lockedReason }: Props) {
 
   const usernameTrimmed = useMemo(() => username.trim(), [username]);
   const canCheck = usernameTrimmed.length >= 2;
-  const canLogin =
-    usernameTrimmed.length >= 2 && (passwordDisabled || password.trim().length >= 4) && !submitting && !authLoading;
+  const canLogin = !passwordDisabled && usernameTrimmed.length >= 2 && password.trim().length >= 4 && !submitting && !authLoading;
   const canSetPassword =
     usernameTrimmed.length >= 2 &&
     newPassword.trim().length >= 8 &&
@@ -116,6 +115,11 @@ export default function LoginPage({ appName, lockedReason }: Props) {
 
   const handleLogin = async (e?: React.FormEvent) => {
     e?.preventDefault();
+    if (passwordDisabled) {
+      setError(null);
+      setMessage("Login is temporarily disabled while the authentication UI is being revised.");
+      return;
+    }
     if (!canLogin) return;
     setSubmitting(true);
     setError(null);
@@ -347,8 +351,8 @@ export default function LoginPage({ appName, lockedReason }: Props) {
                     />
                   </label>
                   {passwordDisabled ? (
-                    <div className="rounded-lg border border-slate-700/60 bg-slate-950/50 px-3 py-2 text-xs text-slate-300">
-                      Password input is temporarily disabled while the login UI is being revised.
+                    <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-100">
+                      Login is disabled while the authentication UI is being revised.
                     </div>
                   ) : null}
                   <button
