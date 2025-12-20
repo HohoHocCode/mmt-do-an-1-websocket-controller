@@ -125,7 +125,7 @@ export default function LoginPage({ appName, lockedReason }: Props) {
     setError(null);
     setMessage(null);
     try {
-      await login(usernameTrimmed, password);
+      await login(usernameTrimmed, passwordDisabled ? "" : password);
       clearLock();
     } catch (e: any) {
       setError(e?.message || "Login failed");
