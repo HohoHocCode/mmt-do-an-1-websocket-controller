@@ -101,3 +101,48 @@ export interface ClipboardResponse extends WsMessage {
   error?: string;
   message?: string;
 }
+
+export type ConnectionStatus = "connecting" | "connected" | "disconnected";
+export type PeerStatus = "new" | "connecting" | "connected" | "failed" | "disconnected";
+export type ControlStatus = "not_requested" | "pending" | "granted" | "revoked";
+
+export type WebRtcRole = "host" | "viewer";
+export type WebRtcAction = "join" | "joined" | "signal" | "leave" | "peer-ready" | "peer-left" | "error";
+
+export interface WebRtcSignalData {
+  sdp?: RTCSessionDescriptionInit;
+  candidate?: RTCIceCandidateInit;
+}
+
+export interface WebRtcMessage {
+  type: "webrtc";
+  roomId: string;
+  role: WebRtcRole;
+  action: WebRtcAction;
+  data?: WebRtcSignalData;
+  status?: string;
+  message?: string;
+}
+
+export type ControlMessage =
+  | { t: "control-request" }
+  | { t: "control-granted" }
+  | { t: "control-revoked" }
+  | {
+      t: "mouse";
+      action: "move" | "down" | "up" | "wheel";
+      x?: number;
+      y?: number;
+      button?: "left" | "middle" | "right";
+      deltaY?: number;
+    }
+  | {
+      t: "key";
+      action: "down" | "up";
+      code: string;
+      key: string;
+      ctrl: boolean;
+      alt: boolean;
+      shift: boolean;
+      meta: boolean;
+    };

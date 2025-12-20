@@ -35,6 +35,7 @@ import LoginPage from "./LoginPage";
 import { useAuth } from "./auth";
 import { ApiError, discoverDevices, getControllerStatus, logAudit, restartController, stopController } from "./api";
 import type { AuthUser, ControllerStatus, DiscoveryDevice, FileItem, HotkeyAction, HotkeyMap, WsMessage } from "./types";
+import RemoteControl from "./pages/RemoteControl";
 
 // [ADDED] App name (để LoginPage / Header dùng thống nhất)
 const APP_NAME = import.meta.env.VITE_APP_NAME || "Remote Desktop Control"; // [ADDED]
@@ -308,6 +309,7 @@ const isFormElement = (target: EventTarget | null) => {
 
 export default function App() {
   const { user, token, locked, lockedReason, lockSession } = useAuth();
+  const [activeView, setActiveView] = useState<"dashboard" | "remote">("dashboard");
   const [targets, setTargets] = useState<RemoteTarget[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
 
@@ -1690,6 +1692,30 @@ export default function App() {
           </div>
         </div>
 
+        <div className="flex flex-wrap items-center gap-2 border border-border bg-slate-900/50 rounded-2xl px-3 py-2 text-sm">
+          <button
+            onClick={() => setActiveView("dashboard")}
+            className={`px-3 py-1.5 rounded-full border ${
+              activeView === "dashboard"
+                ? "border-primary bg-primary/20 text-primary"
+                : "border-border bg-slate-900/60 text-muted-foreground hover:bg-slate-800"
+            }`}
+          >
+            Control Center
+          </button>
+          <button
+            onClick={() => setActiveView("remote")}
+            className={`px-3 py-1.5 rounded-full border ${
+              activeView === "remote"
+                ? "border-primary bg-primary/20 text-primary"
+                : "border-border bg-slate-900/60 text-muted-foreground hover:bg-slate-800"
+            }`}
+          >
+            Remote Control
+          </button>
+        </div>
+
+        {activeView === "dashboard" ? (
         <div className="flex-1 flex flex-col md:flex-row gap-4 min-h-0">
           {/* Sidebar */}
           <aside className="w-full md:w-80 flex flex-col gap-4 min-h-0">
@@ -2506,6 +2532,9 @@ export default function App() {
             )}
           </main>
         </div>
+        ) : (
+          <RemoteControl />
+        )}
       </div>
     </div>
 
