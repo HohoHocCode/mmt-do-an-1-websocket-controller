@@ -21,6 +21,8 @@
 #include <cctype>
 #include <deque>
 #include <functional>
+#include <mutex>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace asio  = boost::asio;
@@ -39,6 +41,37 @@ struct ParsedUrl {
 struct VerifiedUser {
     std::string username;
     std::string role;
+};
+
+class WebSocketSession;
+
+class RoomManager {
+public:
+    void join_room(const std::string& room_id,
+                   const std::string& role,
+                   const std::string& session_id,
+                   const std::weak_ptr<WebSocketSession>& session);
+    void leave_room(const std::string& room_id,
+                    const std::string& role,
+                    const std::string& session_id);
+    void relay_signal(const std::string& room_id,
+                      const std::string& role,
+                      const Json& data,
+                      const std::string& session_id);
+    void remove_session(const std::string& session_id);
+
+private:
+    struct RoomEntry {
+        std::string host_id;
+        std::weak_ptr<WebSocketSession> host;
+        std::string viewer_id;
+        std::weak_ptr<WebSocketSession> viewer;
+    };
+
+    std::mutex mutex_;
+    std::unordered_map<std::string, RoomEntry> rooms_;
+    std::unordered_map<std::string, std::string> session_room_;
+    std::unordered_map<std::string, std::string> session_role_;
 };
 
 static std::string env_string(const char* key, const std::string& fallback) {
@@ -300,14 +333,31 @@ private:
 // ============================================================================
 class WebSocketSession : public std::enable_shared_from_this<WebSocketSession> {
 public:
-    WebSocketSession(tcp::socket socket, asio::thread_pool& dispatcher_pool)
+    WebSocketSession(tcp::socket socket,
+                     asio::thread_pool& dispatcher_pool,
+                     std::shared_ptr<RoomManager> room_manager)
         : ws_(std::move(socket))
         , strand_(asio::make_strand(ws_.get_executor()))
         , stream_timer_(strand_)   // timer dùng chung executor với websocket
         , stream_guard_timer_(strand_)
         , dispatcher_pool_(dispatcher_pool)
         , auth_api_base_(std::getenv("AUTH_API_URL") ? std::getenv("AUTH_API_URL") : "http://localhost:5179")
-    {}
+        , room_manager_(std::move(room_manager))
+    {
+        static std::atomic<std::uint64_t> session_counter{0};
+        session_id_ = "sess-" + std::to_string(++session_counter);
+        boost::system::error_code ec;
+        auto ep = ws_.next_layer().remote_endpoint(ec);
+        if (!ec) {
+            remote_ip_ = ep.address().to_string();
+        }
+    }
+
+    ~WebSocketSession() {
+        if (room_manager_) {
+            room_manager_->remove_session(session_id_);
+        }
+    }
 
     void start() {
         ws_.set_option(ws::stream_base::timeout::suggested(beast::role_type::server));
@@ -324,6 +374,7 @@ public:
     }
 
 private:
+    friend class RoomManager;
     ws::stream<tcp::socket> ws_;
     asio::strand<asio::any_io_executor> strand_;
 
@@ -340,6 +391,11 @@ private:
     std::deque<std::shared_ptr<std::string>> outbox_;
     bool write_in_progress_ = false;
     static constexpr std::size_t max_stream_backlog_ = 5;
+    std::string session_id_;
+    std::string remote_ip_ = "unknown";
+    std::shared_ptr<RoomManager> room_manager_;
+    std::chrono::steady_clock::time_point mouse_window_start_{std::chrono::steady_clock::now()};
+    std::size_t mouse_move_count_ = 0;
 
     // Stream state
     asio::steady_timer stream_timer_;
@@ -376,10 +432,13 @@ private:
 
     // ------------------------------------------------------------------------
     void on_read(beast::error_code ec, std::size_t) {
-        if (ec == ws::error::closed)
+        if (ec == ws::error::closed) {
+            handle_disconnect();
             return;
+        }
         if (ec) {
             std::cerr << "[WsServer] Read error: " << ec.message() << "\n";
+            handle_disconnect();
             return;
         }
 
@@ -387,6 +446,16 @@ private:
         buffer_.consume(buffer_.size());
 
         std::cout << "[WsServer] Received: " << req << "\n";
+        static constexpr std::size_t kMaxMessageBytes = 256 * 1024;
+        if (req.size() > kMaxMessageBytes) {
+            Json resp;
+            resp["cmd"] = "unknown";
+            resp["status"] = "error";
+            resp["message"] = "message_too_large";
+            send_text(resp.dump());
+            do_read();
+            return;
+        }
 
         Json j;
         try {
@@ -397,6 +466,12 @@ private:
             resp["status"] = "error";
             resp["message"] = std::string("invalid_json: ") + e.what();
             send_text(resp.dump());
+            do_read();
+            return;
+        }
+
+        if (j.contains("type") && j["type"].is_string() && j["type"] == "webrtc") {
+            handle_webrtc_message(j);
             do_read();
             return;
         }
@@ -413,6 +488,26 @@ private:
         }
 
         std::string cmd = j["cmd"];
+
+        if (cmd == "input-event") {
+            const std::string kind = j.value("kind", "");
+            const std::string action = j.value("action", "");
+            if (kind == "mouse" && action == "move") {
+                if (!allow_mouse_move()) {
+                    Json resp;
+                    resp["cmd"] = "input-event";
+                    resp["status"] = "error";
+                    resp["error"] = "rate_limited";
+                    resp["message"] = "Too many mouse move events";
+                    apply_request_id(j, resp);
+                    send_text(resp.dump());
+                    do_read();
+                    return;
+                }
+            }
+            j["client_ip"] = remote_ip_;
+            req = j.dump();
+        }
 
         if (cmd == "screen_stream") {
             int duration = j.value("duration", 5);
@@ -564,6 +659,99 @@ private:
         do_read();
     }
 
+    void handle_disconnect() {
+        if (room_manager_) {
+            room_manager_->remove_session(session_id_);
+        }
+    }
+
+    bool allow_mouse_move() {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - mouse_window_start_ > std::chrono::seconds(1)) {
+            mouse_window_start_ = now;
+            mouse_move_count_ = 0;
+        }
+        mouse_move_count_++;
+        return mouse_move_count_ <= 200;
+    }
+
+    void send_json(const Json& payload) {
+        send_text(payload.dump());
+    }
+
+    void handle_webrtc_message(const Json& message) {
+        Json resp;
+        resp["type"] = "webrtc";
+        resp["roomId"] = message.value("roomId", "");
+        resp["role"] = message.value("role", "");
+
+        if (!message.contains("roomId") || !message["roomId"].is_string()) {
+            resp["action"] = "error";
+            resp["message"] = "missing_room";
+            send_json(resp);
+            return;
+        }
+        if (!message.contains("role") || !message["role"].is_string()) {
+            resp["action"] = "error";
+            resp["message"] = "missing_role";
+            send_json(resp);
+            return;
+        }
+        if (!message.contains("action") || !message["action"].is_string()) {
+            resp["action"] = "error";
+            resp["message"] = "missing_action";
+            send_json(resp);
+            return;
+        }
+
+        const std::string room_id = message["roomId"].get<std::string>();
+        const std::string role = message["role"].get<std::string>();
+        const std::string action = message["action"].get<std::string>();
+        if (room_id.empty() || room_id.size() > 64) {
+            resp["action"] = "error";
+            resp["message"] = "invalid_room";
+            send_json(resp);
+            return;
+        }
+        if (role != "host" && role != "viewer") {
+            resp["action"] = "error";
+            resp["message"] = "invalid_role";
+            send_json(resp);
+            return;
+        }
+
+        if (action == "join") {
+            if (room_manager_) {
+                room_manager_->join_room(room_id, role, session_id_, weak_from_this());
+            }
+            return;
+        }
+
+        if (action == "leave") {
+            if (room_manager_) {
+                room_manager_->leave_room(room_id, role, session_id_);
+            }
+            return;
+        }
+
+        if (action == "signal") {
+            if (!message.contains("data") || !message["data"].is_object()) {
+                resp["action"] = "error";
+                resp["message"] = "missing_signal_data";
+                send_json(resp);
+                return;
+            }
+            if (room_manager_) {
+                room_manager_->relay_signal(room_id, role, message["data"], session_id_);
+            }
+            return;
+        }
+
+        resp["action"] = "error";
+        resp["message"] = "unknown_action";
+        send_json(resp);
+    }
+
     void send_error_response(const std::string& cmd, const Json& req, const std::string& message) {
         Json resp;
         resp["cmd"] = cmd;
@@ -578,11 +766,13 @@ private:
             send_error_response(cmd, req, "too many pending requests");
             return false;
         }
-        if (inflight_cmds_.count(cmd) > 0) {
+        if (cmd != "input-event" && inflight_cmds_.count(cmd) > 0) {
             send_error_response(cmd, req, "busy");
             return false;
         }
-        inflight_cmds_.insert(cmd);
+        if (cmd != "input-event") {
+            inflight_cmds_.insert(cmd);
+        }
         pending_jobs_++;
         return true;
     }
@@ -754,6 +944,178 @@ private:
     }
 };
 
+// ============================================================================
+// RoomManager
+// ============================================================================
+void RoomManager::join_room(const std::string& room_id,
+                            const std::string& role,
+                            const std::string& session_id,
+                            const std::weak_ptr<WebSocketSession>& session) {
+    std::shared_ptr<WebSocketSession> sender = session.lock();
+    std::shared_ptr<WebSocketSession> peer;
+    std::shared_ptr<WebSocketSession> replaced;
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto& entry = rooms_[room_id];
+        if (role == "host") {
+            if (!entry.host_id.empty() && entry.host_id != session_id) {
+                replaced = entry.host.lock();
+                session_room_.erase(entry.host_id);
+                session_role_.erase(entry.host_id);
+            }
+            entry.host_id = session_id;
+            entry.host = session;
+            peer = entry.viewer.lock();
+        } else {
+            if (!entry.viewer_id.empty() && entry.viewer_id != session_id) {
+                replaced = entry.viewer.lock();
+                session_room_.erase(entry.viewer_id);
+                session_role_.erase(entry.viewer_id);
+            }
+            entry.viewer_id = session_id;
+            entry.viewer = session;
+            peer = entry.host.lock();
+        }
+        session_room_[session_id] = room_id;
+        session_role_[session_id] = role;
+    }
+
+    if (sender) {
+        Json joined;
+        joined["type"] = "webrtc";
+        joined["roomId"] = room_id;
+        joined["role"] = role;
+        joined["action"] = "joined";
+        joined["status"] = "ok";
+        sender->send_json(joined);
+    }
+
+    if (replaced && replaced != sender) {
+        Json payload;
+        payload["type"] = "webrtc";
+        payload["roomId"] = room_id;
+        payload["role"] = role;
+        payload["action"] = "peer-left";
+        replaced->send_json(payload);
+    }
+
+    if (peer && sender) {
+        Json ready_for_sender;
+        ready_for_sender["type"] = "webrtc";
+        ready_for_sender["roomId"] = room_id;
+        ready_for_sender["role"] = role;
+        ready_for_sender["action"] = "peer-ready";
+        sender->send_json(ready_for_sender);
+
+        Json ready_for_peer;
+        ready_for_peer["type"] = "webrtc";
+        ready_for_peer["roomId"] = room_id;
+        ready_for_peer["role"] = role == "host" ? "viewer" : "host";
+        ready_for_peer["action"] = "peer-ready";
+        peer->send_json(ready_for_peer);
+    }
+}
+
+void RoomManager::leave_room(const std::string& room_id,
+                             const std::string& role,
+                             const std::string& session_id) {
+    std::shared_ptr<WebSocketSession> peer;
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = rooms_.find(room_id);
+        if (it == rooms_.end()) return;
+        auto& entry = it->second;
+
+        if (role == "host" && entry.host_id == session_id) {
+            entry.host_id.clear();
+            entry.host.reset();
+            peer = entry.viewer.lock();
+        } else if (role == "viewer" && entry.viewer_id == session_id) {
+            entry.viewer_id.clear();
+            entry.viewer.reset();
+            peer = entry.host.lock();
+        }
+
+        session_room_.erase(session_id);
+        session_role_.erase(session_id);
+
+        if (entry.host_id.empty() && entry.viewer_id.empty()) {
+            rooms_.erase(it);
+        }
+    }
+
+    if (peer) {
+        Json payload;
+        payload["type"] = "webrtc";
+        payload["roomId"] = room_id;
+        payload["role"] = role == "host" ? "viewer" : "host";
+        payload["action"] = "peer-left";
+        peer->send_json(payload);
+    }
+}
+
+void RoomManager::relay_signal(const std::string& room_id,
+                               const std::string& role,
+                               const Json& data,
+                               const std::string& session_id) {
+    (void)session_id;
+    std::shared_ptr<WebSocketSession> peer;
+    std::shared_ptr<WebSocketSession> sender;
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = rooms_.find(room_id);
+        if (it == rooms_.end()) {
+            return;
+        }
+        auto& entry = it->second;
+        if (role == "host") {
+            peer = entry.viewer.lock();
+            sender = entry.host.lock();
+        } else {
+            peer = entry.host.lock();
+            sender = entry.viewer.lock();
+        }
+    }
+
+    if (!peer) {
+        if (sender) {
+            Json error;
+            error["type"] = "webrtc";
+            error["roomId"] = room_id;
+            error["role"] = role;
+            error["action"] = "error";
+            error["message"] = "peer_not_ready";
+            sender->send_json(error);
+        }
+        return;
+    }
+
+    Json relay;
+    relay["type"] = "webrtc";
+    relay["roomId"] = room_id;
+    relay["role"] = role;
+    relay["action"] = "signal";
+    relay["data"] = data;
+    peer->send_json(relay);
+}
+
+void RoomManager::remove_session(const std::string& session_id) {
+    std::string room;
+    std::string role;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = session_room_.find(session_id);
+        if (it == session_room_.end()) return;
+        room = it->second;
+        auto role_it = session_role_.find(session_id);
+        if (role_it == session_role_.end()) return;
+        role = role_it->second;
+    }
+    leave_room(room, role, session_id);
+}
 
 
 // ============================================================================
@@ -761,10 +1123,14 @@ private:
 // ============================================================================
 class Listener : public std::enable_shared_from_this<Listener> {
 public:
-    Listener(asio::io_context& ioc, tcp::endpoint endpoint, asio::thread_pool& dispatcher_pool)
+    Listener(asio::io_context& ioc,
+             tcp::endpoint endpoint,
+             asio::thread_pool& dispatcher_pool,
+             std::shared_ptr<RoomManager> room_manager)
         : ioc_(ioc)
         , acceptor_(ioc)
         , dispatcher_pool_(dispatcher_pool)
+        , room_manager_(std::move(room_manager))
     {
         beast::error_code ec;
 
@@ -782,6 +1148,7 @@ private:
     asio::io_context& ioc_;
     tcp::acceptor acceptor_;
     asio::thread_pool& dispatcher_pool_;
+    std::shared_ptr<RoomManager> room_manager_;
 
     void do_accept() {
         acceptor_.async_accept(
@@ -795,7 +1162,7 @@ private:
 
     void on_accept(beast::error_code ec, tcp::socket socket) {
         if (!ec) {
-            std::make_shared<WebSocketSession>(std::move(socket), dispatcher_pool_)->start();
+            std::make_shared<WebSocketSession>(std::move(socket), dispatcher_pool_, room_manager_)->start();
         }
         do_accept();
     }
@@ -809,6 +1176,7 @@ struct WsServer::Impl {
     asio::io_context ioc;
     std::unique_ptr<DiscoveryResponder> discovery;
     asio::thread_pool dispatcher_pool{std::max(2u, std::thread::hardware_concurrency())};
+    std::shared_ptr<RoomManager> room_manager = std::make_shared<RoomManager>();
 
     void start(const std::string& addr, unsigned short port) {
         const bool enable_discovery = env_flag("DISCOVERY_ENABLED", true);
@@ -823,7 +1191,7 @@ struct WsServer::Impl {
         }
 
         tcp::endpoint ep(asio::ip::make_address(addr), port);
-        std::make_shared<Listener>(ioc, ep, dispatcher_pool)->run();
+        std::make_shared<Listener>(ioc, ep, dispatcher_pool, room_manager)->run();
         std::cout << "[WsServer] Listening on " << addr << ":" << port << "\n";
         ioc.run();
 
