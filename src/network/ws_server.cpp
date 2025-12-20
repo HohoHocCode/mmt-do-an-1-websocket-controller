@@ -411,6 +411,7 @@ private:
     std::atomic<std::uint64_t> stream_generation_{0};
     std::atomic<bool> stream_cancelled_{true};
     std::atomic<std::size_t> stream_pending_jobs_{0};
+    std::atomic<std::uint64_t> stream_pending_generation_{0};
     static constexpr std::size_t max_stream_pending_jobs_ = 3;
 
     struct StreamConfig {
@@ -941,6 +942,8 @@ private:
         stream_total_frames_ = duration * stream_config_.fps;
         const auto generation = stream_generation_.fetch_add(1) + 1;
         stream_cancelled_.store(false);
+        stream_pending_generation_.store(generation);
+        stream_pending_jobs_.store(0);
         stream_stats_ = StreamTelemetry{};
 
         stream_guard_timer_.expires_after(std::chrono::seconds(60));
@@ -1009,7 +1012,7 @@ private:
         asio::post(stream_pool_, [self, generation, seq, config]() {
             if (self->stream_cancelled_.load() || generation != self->stream_generation_.load()) {
                 asio::post(self->strand_, [self, generation]() {
-                    self->complete_stream_job();
+                    self->complete_stream_job(generation);
                     if (generation != self->stream_generation_.load()) {
                         self->stream_stats_.frames_dropped++;
                     }
@@ -1040,7 +1043,10 @@ private:
         );
     }
 
-    void complete_stream_job() {
+    void complete_stream_job(std::uint64_t generation) {
+        if (generation != stream_pending_generation_.load()) {
+            return;
+        }
         auto pending = stream_pending_jobs_.load();
         if (pending > 0) {
             stream_pending_jobs_.fetch_sub(1);
@@ -1048,7 +1054,7 @@ private:
     }
 
     void handle_stream_result(std::uint64_t generation, int seq, ScreenCaptureResult result) {
-        complete_stream_job();
+        complete_stream_job(generation);
         if (!streaming_ || generation != stream_generation_.load() || stream_cancelled_.load()) {
             stream_stats_.frames_dropped++;
             return;
