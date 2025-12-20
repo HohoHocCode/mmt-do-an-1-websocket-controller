@@ -260,13 +260,15 @@ const LOG_LIMIT = 400;
 const describeFileError = (error: string | undefined, message?: string) => {
   switch (error) {
     case "path_not_allowed":
-      return "Path not allowed (outside server root).";
+      return message || "Path not allowed (outside server root).";
     case "not_found":
       return "File or directory not found.";
     case "permission_denied":
       return "Permission denied.";
     case "delete_failed":
       return "Delete failed.";
+    case "not_directory":
+      return "Path is not a directory.";
     case "not_supported":
       return "Clipboard supported on Windows only.";
     default:
@@ -340,10 +342,15 @@ export default function App() {
   const [pendingDelete, setPendingDelete] = useState<{ path: string } | null>(null);
 
   const logsEndRef = useRef<HTMLDivElement | null>(null);
+  const logsContainerRef = useRef<HTMLDivElement | null>(null);
+  const logScrollRafRef = useRef<number | null>(null);
+  const logAutoScrollRef = useRef(true);
   const activityTimers = useRef<Record<string, ReturnType<typeof setTimeout> | undefined>>({});
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingActionsRef = useRef<Record<string, Record<string, PendingAction | undefined>>>({});
   const pendingTimeoutsRef = useRef<Record<string, ReturnType<typeof setTimeout> | undefined>>({});
+  const discoverAbortRef = useRef<AbortController | null>(null);
+  const streamFrameRef = useRef<Record<string, { frame?: LastImage; rafId?: number }>>({});
   const responseWaitersRef = useRef<
     Record<
       string,
@@ -424,8 +431,27 @@ export default function App() {
   }, [targets, activeId]);
 
   useEffect(() => {
-    logsEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [targets, activeId]);
+    logAutoScrollRef.current = true;
+  }, [active?.id]);
+
+  const handleLogsScroll = useCallback(() => {
+    const container = logsContainerRef.current;
+    if (!container) return;
+    const distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
+    logAutoScrollRef.current = distanceFromBottom < 48;
+  }, []);
+
+  useEffect(() => {
+    const container = logsContainerRef.current;
+    if (!container || !logAutoScrollRef.current) return;
+    if (logScrollRafRef.current) {
+      cancelAnimationFrame(logScrollRafRef.current);
+    }
+    logScrollRafRef.current = requestAnimationFrame(() => {
+      container.scrollTop = container.scrollHeight;
+      logScrollRafRef.current = null;
+    });
+  }, [active?.id, active?.logs.length]);
 
   const fetchControllerStatus = useCallback(async () => {
     if (!token) return;
@@ -461,6 +487,11 @@ export default function App() {
         Object.values(pendingTimeoutsRef.current).forEach((timer) => {
           if (timer) clearTimeout(timer);
         });
+        Object.values(streamFrameRef.current).forEach((entry) => {
+          if (entry.rafId) cancelAnimationFrame(entry.rafId);
+        });
+        if (logScrollRafRef.current) cancelAnimationFrame(logScrollRafRef.current);
+        discoverAbortRef.current?.abort();
         if (toastTimer.current) clearTimeout(toastTimer.current);
       } catch {}
     };
@@ -501,6 +532,30 @@ export default function App() {
       )
     );
   };
+
+  const scheduleStreamFrame = useCallback((targetId: string, base64: string, seq?: number) => {
+    const entry = streamFrameRef.current[targetId] ?? {};
+    entry.frame = { kind: "screen_stream", base64, ts: Date.now(), seq };
+    if (entry.rafId == null) {
+      entry.rafId = requestAnimationFrame(() => {
+        const current = streamFrameRef.current[targetId];
+        if (!current?.frame) return;
+        const frame = current.frame;
+        current.rafId = undefined;
+        setTargets((inner) =>
+          inner.map((x) => {
+            if (x.id !== targetId || !x.stream.running) return x;
+            return {
+              ...x,
+              lastImage: frame,
+              stream: { ...x.stream, running: true, lastSeq: typeof frame.seq === "number" ? frame.seq : x.stream.lastSeq },
+            };
+          })
+        );
+      });
+    }
+    streamFrameRef.current[targetId] = entry;
+  }, []);
 
   const markRunning = (id: string, label: string) => {
     clearActivityTimer(id);
@@ -796,10 +851,20 @@ export default function App() {
 
   const handleDiscoverDevices = async () => {
     if (!token) return;
+    if (discovering) {
+      discoverAbortRef.current?.abort();
+      discoverAbortRef.current = null;
+      setDiscovering(false);
+      showToast({ text: "Discovery stopped", tone: "info" });
+      return;
+    }
+    const controller = new AbortController();
+    discoverAbortRef.current = controller;
     setDiscovering(true);
     setDiscoverError(null);
+    setDiscoveredDevices([]);
     try {
-      const res = await discoverDevices(token, { retries: 2 });
+      const res = await discoverDevices(token, { retries: 2 }, controller.signal);
       const list = (res.devices || []).map((d) => ({
         ...d,
         lastSeenMs: d.lastSeenMs ?? Date.now(),
@@ -812,10 +877,14 @@ export default function App() {
         showToast({ text: `Found ${list.length} device(s)`, tone: "success" });
       }
     } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") {
+        return;
+      }
       const msg = err instanceof ApiError ? err.message : "Discovery failed";
       setDiscoverError(msg);
     } finally {
       setDiscovering(false);
+      discoverAbortRef.current = null;
     }
   };
 
@@ -956,22 +1025,8 @@ export default function App() {
           // screen_stream frames
           if (data.cmd === "screen_stream" && typeof data.image_base64 === "string") {
             const seq = typeof data.seq === "number" ? data.seq : undefined;
-            let updated = false;
-            setTargets((inner) =>
-              inner.map((x) => {
-                if (x.id !== id) return x;
-                if (!x.stream.running) return x;
-                updated = true;
-                return {
-                  ...x,
-                  lastImage: { kind: "screen_stream", base64: data.image_base64 as string, ts: Date.now(), seq },
-                  stream: { ...x.stream, running: true, lastSeq: typeof seq === "number" ? seq : x.stream.lastSeq },
-                };
-              })
-            );
-            if (updated) {
-              markRunning(id, "Streaming");
-            }
+            scheduleStreamFrame(id, data.image_base64 as string, seq);
+            markRunning(id, "Streaming");
             return;
           }
 
@@ -1061,8 +1116,9 @@ export default function App() {
             } else {
               const error = typeof data.error === "string" ? data.error : undefined;
               const message = typeof data.message === "string" ? data.message : undefined;
-              updateFileState(id, { listing: false, error: error ?? message ?? "List failed" });
-              showToast({ text: describeFileError(error, message), tone: "error" });
+              const description = describeFileError(error, message);
+              updateFileState(id, { listing: false, error: description });
+              showToast({ text: description, tone: "error" });
               markError(id, message || "List failed");
             }
             return;
@@ -1091,8 +1147,9 @@ export default function App() {
             } else {
               const error = typeof data.error === "string" ? data.error : undefined;
               const message = typeof data.message === "string" ? data.message : undefined;
-              updateFileState(id, { deletingPath: null, error: error ?? message ?? "Delete failed" });
-              showToast({ text: describeFileError(error, message), tone: "error" });
+              const description = describeFileError(error, message);
+              updateFileState(id, { deletingPath: null, error: description });
+              showToast({ text: description, tone: "error" });
               markError(id, message || "Delete failed");
             }
             return;
@@ -1808,11 +1865,14 @@ export default function App() {
                 </div>
                 <button
                   onClick={handleDiscoverDevices}
-                  disabled={discovering}
-                  className="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg bg-slate-900/70 border border-border text-xs hover:bg-slate-800 disabled:opacity-50"
+                  className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-lg border text-xs ${
+                    discovering
+                      ? "bg-amber-500/10 text-amber-100 border-amber-400/40 hover:bg-amber-500/20"
+                      : "bg-slate-900/70 border-border hover:bg-slate-800"
+                  }`}
                 >
                   {discovering ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
-                  Discover on LAN
+                  {discovering ? "Stop discovery" : "Discover on LAN"}
                 </button>
               </div>
               {discoverError ? <p className="text-[11px] text-amber-200">{discoverError}</p> : null}
@@ -2434,7 +2494,7 @@ export default function App() {
                       <div className="flex flex-wrap gap-2">
                         <input
                           value={active.files.dir}
-                          onChange={(e) => updateFileState(active.id, { dir: e.target.value })}
+                          onChange={(e) => updateFileState(active.id, { dir: e.target.value, error: null })}
                           className="flex-1 min-w-[220px] px-3 py-2 rounded-lg bg-slate-900/60 border border-border text-sm focus:outline-none focus:ring-2 focus:ring-primary/60"
                           placeholder="Directory (e.g. .)"
                           aria-label="Directory"
@@ -2449,6 +2509,12 @@ export default function App() {
                           <RefreshCw className="w-4 h-4" /> List
                         </button>
                       </div>
+
+                      {active.files.error ? (
+                        <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-100">
+                          {active.files.error}
+                        </div>
+                      ) : null}
 
                       <div className="overflow-auto rounded-xl border border-border bg-slate-950/30">
                         <table className="w-full text-xs">
@@ -2573,7 +2639,11 @@ export default function App() {
                       </button>
                     </div>
 
-                    <div className="flex-1 overflow-auto rounded-xl border border-border bg-slate-950/30 p-3">
+                    <div
+                      ref={logsContainerRef}
+                      onScroll={handleLogsScroll}
+                      className="flex-1 overflow-auto rounded-xl border border-border bg-slate-950/30 p-3"
+                    >
                       {active.logs.map((l, i) => (
                         <div key={i} className="text-xs">
                           <span className="text-muted-foreground font-mono">[{formatTime(l.timestamp)}]</span>{" "}

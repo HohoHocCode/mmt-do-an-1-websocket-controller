@@ -328,7 +328,9 @@ Json Dispatcher::handle_list_files(const Json& req)
     if (!resolve_safe_path(dir, path_result)) {
         resp["status"] = "error";
         resp["error"] = path_result.error;
-        resp["message"] = "Path not allowed";
+        const std::string root_str = path_result.root.lexically_normal().generic_string();
+        resp["message"] = "Path not allowed (root: " + root_str + ")";
+        resp["root"] = root_str;
         resp["dir"] = dir;
         return resp;
     }
@@ -418,7 +420,9 @@ Json Dispatcher::handle_delete_file(const Json& req)
     if (!resolve_safe_path(path, path_result)) {
         resp["status"] = "error";
         resp["error"] = path_result.error;
-        resp["message"] = "Path not allowed";
+        const std::string root_str = path_result.root.lexically_normal().generic_string();
+        resp["message"] = "Path not allowed (root: " + root_str + ")";
+        resp["root"] = root_str;
         resp["path"] = path;
         return resp;
     }
@@ -464,7 +468,9 @@ Json Dispatcher::handle_download_file(const Json& req)
     if (!resolve_safe_path(path, path_result)) {
         resp["status"] = "error";
         resp["error"] = path_result.error;
-        resp["message"] = "Path not allowed";
+        const std::string root_str = path_result.root.lexically_normal().generic_string();
+        resp["message"] = "Path not allowed (root: " + root_str + ")";
+        resp["root"] = root_str;
         resp["path"] = path;
         return resp;
     }

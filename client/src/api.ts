@@ -85,10 +85,14 @@ export function logAudit(token: string, action: string, meta: Record<string, unk
   );
 }
 
-export function discoverDevices(token: string, payload?: { timeoutMs?: number; retries?: number; port?: number }) {
+export function discoverDevices(
+  token: string,
+  payload?: { timeoutMs?: number; retries?: number; port?: number },
+  signal?: AbortSignal
+) {
   return request<{ ok: boolean; devices: DiscoveryDevice[] }>(
-    "/discover/start",
-    { method: "POST", body: JSON.stringify(payload ?? {}) },
+    "/discover",
+    { method: "POST", body: JSON.stringify(payload ?? {}), signal },
     token
   );
 }
