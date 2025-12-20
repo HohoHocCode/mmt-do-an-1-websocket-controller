@@ -6,7 +6,7 @@
       "generator": "Ninja",
       "binaryDir": "build",
       "cacheVariables": {
-        "CMAKE_MAKE_PROGRAM": "/mingw64/bin/ninja",
+        "CMAKE_MAKE_PROGRAM": "ninja",
         "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/vcpkg/scripts/buildsystems/vcpkg.cmake",
         "VCPKG_TARGET_TRIPLET": "x64-mingw-static"
       }
@@ -24,10 +24,23 @@
       "name": "windows-msvc",
       "generator": "Visual Studio 17 2022",
       "binaryDir": "${sourceDir}/build/windows-msvc"
+    },
+    {
+      "name": "windows-msvc-vcpkg",
+      "generator": "Visual Studio 17 2022",
+      "binaryDir": "${sourceDir}/build/windows-msvc-vcpkg",
+      "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/vcpkg/scripts/buildsystems/vcpkg.cmake",
+        "VCPKG_TARGET_TRIPLET": "x64-windows"
+      }
     }
   ],
 
   "buildPresets": [
+    {
+      "name": "mingw64",
+      "configurePreset": "mingw64"
+    },
     {
       "name": "codex-linux",
       "configurePreset": "codex-linux"
@@ -35,6 +48,11 @@
     {
       "name": "windows-msvc",
       "configurePreset": "windows-msvc",
+      "configuration": "Release"
+    },
+    {
+      "name": "windows-msvc-vcpkg",
+      "configurePreset": "windows-msvc-vcpkg",
       "configuration": "Release"
     }
   ],
