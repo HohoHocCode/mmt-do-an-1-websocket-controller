@@ -4,6 +4,7 @@
 #include "utils/limits.hpp"
 #include "modules/screen.hpp"
 #include "modules/system_control.hpp"
+#include "modules/consent.hpp"
 
 #include <boost/asio.hpp>
 #include <boost/beast/core.hpp>
@@ -314,7 +315,6 @@ private:
         payload["wsPort"] = ws_port_;
         payload["name"] = name_;
         payload["version"] = version_;
-        payload["ip"] = remote_endpoint_.address().to_string();
         payload["timestamp"] = static_cast<long long>(
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::system_clock::now().time_since_epoch()
@@ -519,6 +519,28 @@ private:
         std::string cmd = j["cmd"];
 
         if (cmd == "input-event") {
+            if (!env_flag("ALLOW_REMOTE_CONTROL", false)) {
+                Json resp;
+                resp["cmd"] = "input-event";
+                resp["status"] = "error";
+                resp["error"] = "disabled";
+                resp["message"] = "Remote control disabled (set ALLOW_REMOTE_CONTROL=1)";
+                apply_request_id(j, resp);
+                send_text(resp.dump());
+                do_read();
+                return;
+            }
+            if (!verified_user_) {
+                Json resp;
+                resp["cmd"] = "input-event";
+                resp["status"] = "error";
+                resp["error"] = "auth_required";
+                resp["message"] = "Authentication required";
+                apply_request_id(j, resp);
+                send_text(resp.dump());
+                do_read();
+                return;
+            }
             const std::string kind = j.value("kind", "");
             const std::string action = j.value("action", "");
             if (kind == "mouse" && action == "move") {
@@ -675,6 +697,29 @@ private:
                 resp["cmd"] = cmd;
                 resp["status"] = "error";
                 resp["message"] = "admin_token_required";
+                apply_request_id(j, resp);
+                send_text(resp.dump());
+                do_read();
+                return;
+            }
+            if (!env_flag("ALLOW_REMOTE_CONTROL", false) || !env_flag("ALLOW_POWER_ACTIONS", false)) {
+                Json resp;
+                resp["cmd"] = cmd;
+                resp["status"] = "error";
+                resp["error"] = "disabled";
+                resp["message"] = "Power actions disabled (set ALLOW_REMOTE_CONTROL=1 and ALLOW_POWER_ACTIONS=1)";
+                apply_request_id(j, resp);
+                send_text(resp.dump());
+                do_read();
+                return;
+            }
+            static ConsentManager consent;
+            if (!consent.is_session_active() && !consent.request_permission(remote_ip_)) {
+                Json resp;
+                resp["cmd"] = cmd;
+                resp["status"] = "error";
+                resp["error"] = "consent_required";
+                resp["message"] = "Explicit consent required";
                 apply_request_id(j, resp);
                 send_text(resp.dump());
                 do_read();
