@@ -139,6 +139,10 @@ void WsClient::close()
         io_thread_->join();
 }
 
+bool WsClient::is_connected() const {
+    return connected_.load();
+}
+
 void WsClient::start_read_loop()
 {
     auto buffer = std::make_shared<beast::flat_buffer>();

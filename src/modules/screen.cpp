@@ -1,6 +1,8 @@
 #include "modules/screen.hpp"
 #include "utils/base64.hpp"
+#include "utils/limits.hpp"
 
+#if defined(_WIN32) && defined(MMT_ENABLE_OPENCV)
 #include <windows.h>
 #include <vector>
 #include <string>
@@ -10,10 +12,6 @@
 #include <opencv2/opencv.hpp>
 
 namespace {
-int clamp_quality(int quality) {
-    return std::clamp(quality, 30, 95);
-}
-
 cv::Size compute_target_size(int width, int height, int max_width, int max_height, bool& resized) {
     resized = false;
     if (max_width <= 0 && max_height <= 0) {
@@ -99,7 +97,7 @@ ScreenCaptureResult ScreenCapture::capture_base64(const ScreenCaptureOptions& op
 
     const auto encode_start = std::chrono::steady_clock::now();
     std::vector<uchar> encoded;
-    int quality = clamp_quality(options.jpeg_quality);
+    int quality = limits::clamp_stream_jpeg_quality(options.jpeg_quality);
     cv::imencode(".jpg", resized ? resized_img : img, encoded, { cv::IMWRITE_JPEG_QUALITY, quality });
 
     result.base64 = base64_encode(encoded.data(), encoded.size());
@@ -117,3 +115,12 @@ ScreenCaptureResult ScreenCapture::capture_base64(const ScreenCaptureOptions& op
 bool ScreenCapture::supports_resize() {
     return true;
 }
+#else
+ScreenCaptureResult ScreenCapture::capture_base64(const ScreenCaptureOptions&) {
+    return {};
+}
+
+bool ScreenCapture::supports_resize() {
+    return false;
+}
+#endif

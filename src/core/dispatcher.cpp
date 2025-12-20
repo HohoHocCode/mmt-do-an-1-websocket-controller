@@ -5,6 +5,9 @@
 #include "modules/system_control.hpp"
 #include "modules/consent.hpp"
 #include "utils/base64.hpp"
+#include "utils/json.hpp"
+#include "utils/limits.hpp"
+#include "utils/path_utils.hpp"
 
 #include <iostream>
 #include <fstream>
@@ -21,62 +24,6 @@
 #define KEYLOGGER_FILE_NAME "keylogger.txt"
 
 namespace {
-constexpr std::size_t kMinChunkBytes = 4096;
-constexpr std::size_t kMaxChunkBytes = 262144;
-
-std::filesystem::path get_file_root() {
-    const char* env_root = std::getenv("SERVER_FILE_ROOT");
-    if (env_root && *env_root) {
-        return std::filesystem::path(env_root);
-    }
-    return std::filesystem::current_path();
-}
-
-bool is_subpath(const std::filesystem::path& path, const std::filesystem::path& root) {
-    auto path_it = path.begin();
-    auto root_it = root.begin();
-    for (; root_it != root.end(); ++root_it, ++path_it) {
-        if (path_it == path.end() || *path_it != *root_it) {
-            return false;
-        }
-    }
-    return true;
-}
-
-bool resolve_safe_path(const std::string& raw,
-                       std::filesystem::path& resolved,
-                       std::filesystem::path& root_out,
-                       std::string& error_out) {
-    std::error_code ec;
-    std::filesystem::path root = get_file_root();
-    root = std::filesystem::weakly_canonical(root, ec);
-    if (ec) {
-        ec.clear();
-        root = std::filesystem::absolute(root, ec);
-    }
-    root = root.lexically_normal();
-    root_out = root;
-
-    std::filesystem::path candidate(raw);
-    if (candidate.is_relative()) {
-        candidate = root / candidate;
-    }
-    std::filesystem::path normalized = std::filesystem::weakly_canonical(candidate, ec);
-    if (ec) {
-        ec.clear();
-        normalized = std::filesystem::absolute(candidate, ec);
-    }
-    normalized = normalized.lexically_normal();
-
-    if (!is_subpath(normalized, root)) {
-        error_out = "path_not_allowed";
-        return false;
-    }
-
-    resolved = normalized;
-    return true;
-}
-
 void ensure_response_shape(const std::string& cmd, Json& resp) {
     if (!resp.contains("cmd")) {
         resp["cmd"] = cmd.empty() ? "unknown" : cmd;
@@ -84,6 +31,15 @@ void ensure_response_shape(const std::string& cmd, Json& resp) {
     if (!resp.contains("status")) {
         resp["status"] = resp.contains("error") ? "error" : "ok";
     }
+}
+
+Json build_error_response(const std::string& cmd, const std::string& code, const std::string& message) {
+    Json resp;
+    resp["cmd"] = cmd.empty() ? "unknown" : cmd;
+    resp["status"] = "error";
+    resp["error"] = code;
+    resp["message"] = message;
+    return resp;
 }
 } // namespace
 std::string Dispatcher::handle(const std::string& request_json)
@@ -95,7 +51,18 @@ std::string Dispatcher::handle(const std::string& request_json)
     std::string cmd;
 
     try {
-        Json req = Json::parse(request_json);
+        if (request_json.size() > limits::kMaxMessageBytes) {
+            res = build_error_response("unknown", "message_too_large", "Message too large");
+            return res.dump();
+        }
+
+        JsonParseResult parsed = parse_json_safe(request_json);
+        if (!parsed.ok) {
+            res = build_error_response("unknown", parsed.error, "Invalid JSON");
+            return res.dump();
+        }
+
+        Json req = std::move(parsed.value);
         cmd = req.value("cmd", "");
         if (req.contains("requestId") && req["requestId"].is_string()) {
             request_id = req["requestId"].get<std::string>();
@@ -166,10 +133,7 @@ std::string Dispatcher::handle(const std::string& request_json)
         }
     }
     catch (const std::exception& e) {
-        res["cmd"] = cmd.empty() ? "unknown" : cmd;
-        res["status"]  = "error";
-        res["error"] = "exception";
-        res["message"] = std::string("Exception: ") + e.what();
+        res = build_error_response(cmd, "exception", std::string("Exception: ") + e.what());
     }
 
     ensure_response_shape(cmd, res);
@@ -360,26 +324,24 @@ Json Dispatcher::handle_list_files(const Json& req)
     }
 
     std::string dir = req["dir"].get<std::string>();
-    std::filesystem::path resolved;
-    std::filesystem::path root;
-    std::string error;
-    if (!resolve_safe_path(dir, resolved, root, error)) {
+    SafePathResult path_result;
+    if (!resolve_safe_path(dir, path_result)) {
         resp["status"] = "error";
-        resp["error"] = error;
+        resp["error"] = path_result.error;
         resp["message"] = "Path not allowed";
         resp["dir"] = dir;
         return resp;
     }
 
     std::error_code ec;
-    if (!std::filesystem::exists(resolved, ec)) {
+    if (!std::filesystem::exists(path_result.resolved, ec)) {
         resp["status"] = "error";
         resp["error"] = "not_found";
         resp["message"] = "Directory not found";
         resp["dir"] = dir;
         return resp;
     }
-    if (!std::filesystem::is_directory(resolved, ec)) {
+    if (!std::filesystem::is_directory(path_result.resolved, ec)) {
         resp["status"] = "error";
         resp["error"] = "not_directory";
         resp["message"] = "Path is not a directory";
@@ -388,7 +350,7 @@ Json Dispatcher::handle_list_files(const Json& req)
     }
 
     Json items = Json::array();
-    std::filesystem::directory_iterator it(resolved, ec);
+    std::filesystem::directory_iterator it(path_result.resolved, ec);
     if (ec) {
         resp["status"] = "error";
         resp["error"] = "permission_denied";
@@ -412,7 +374,7 @@ Json Dispatcher::handle_list_files(const Json& req)
             }
 
             std::string rel_path;
-            std::filesystem::path relative = std::filesystem::relative(path, root, entry_ec);
+            std::filesystem::path relative = std::filesystem::relative(path, path_result.root, entry_ec);
             if (!entry_ec) {
                 rel_path = relative.lexically_normal().generic_string();
             } else {
@@ -452,19 +414,17 @@ Json Dispatcher::handle_delete_file(const Json& req)
     }
 
     std::string path = req["path"].get<std::string>();
-    std::filesystem::path resolved;
-    std::filesystem::path root;
-    std::string error;
-    if (!resolve_safe_path(path, resolved, root, error)) {
+    SafePathResult path_result;
+    if (!resolve_safe_path(path, path_result)) {
         resp["status"] = "error";
-        resp["error"] = error;
+        resp["error"] = path_result.error;
         resp["message"] = "Path not allowed";
         resp["path"] = path;
         return resp;
     }
 
     std::error_code ec;
-    bool removed = std::filesystem::remove(resolved, ec);
+    bool removed = std::filesystem::remove(path_result.resolved, ec);
     if (!removed || ec) {
         resp["status"] = "error";
         if (ec == std::errc::no_such_file_or_directory) {
@@ -500,12 +460,10 @@ Json Dispatcher::handle_download_file(const Json& req)
     }
 
     std::string path = req["path"].get<std::string>();
-    std::filesystem::path resolved;
-    std::filesystem::path root;
-    std::string error;
-    if (!resolve_safe_path(path, resolved, root, error)) {
+    SafePathResult path_result;
+    if (!resolve_safe_path(path, path_result)) {
         resp["status"] = "error";
-        resp["error"] = error;
+        resp["error"] = path_result.error;
         resp["message"] = "Path not allowed";
         resp["path"] = path;
         return resp;
@@ -523,7 +481,7 @@ Json Dispatcher::handle_download_file(const Json& req)
         offset = static_cast<std::size_t>(std::max<std::int64_t>(0, req["offset"].get<std::int64_t>()));
     }
 
-    std::size_t max_bytes = kMaxChunkBytes;
+    std::size_t max_bytes = limits::kMaxDownloadChunkBytes;
     if (req.contains("max_bytes")) {
         if (!req["max_bytes"].is_number_integer()) {
             resp["status"] = "error";
@@ -533,11 +491,11 @@ Json Dispatcher::handle_download_file(const Json& req)
             return resp;
         }
         auto requested = static_cast<std::size_t>(std::max<std::int64_t>(0, req["max_bytes"].get<std::int64_t>()));
-        max_bytes = std::min(std::max(requested, kMinChunkBytes), kMaxChunkBytes);
+        max_bytes = limits::clamp_download_chunk_bytes(requested);
     }
 
     std::error_code ec;
-    auto file_size = std::filesystem::file_size(resolved, ec);
+    auto file_size = std::filesystem::file_size(path_result.resolved, ec);
     if (ec) {
         resp["status"] = "error";
         if (ec == std::errc::no_such_file_or_directory) {
@@ -564,7 +522,7 @@ Json Dispatcher::handle_download_file(const Json& req)
         return resp;
     }
 
-    std::ifstream file(resolved, std::ios::binary);
+    std::ifstream file(path_result.resolved, std::ios::binary);
     if (!file) {
         resp["status"] = "error";
         resp["error"] = "read_failed";

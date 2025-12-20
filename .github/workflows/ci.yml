@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake --preset codex-linux
+
+      - name: Build
+        run: cmake --build --preset codex-linux
+
+      - name: Test
+        run: ctest --preset codex-linux --output-on-failure
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: client/web/package-lock.json
+
+      - name: Web build
+        working-directory: client/web
+        run: |
+          npm ci
+          npm run build
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake --preset windows-msvc
+
+      - name: Build
+        run: cmake --build --preset windows-msvc

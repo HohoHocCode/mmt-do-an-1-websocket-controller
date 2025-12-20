@@ -19,6 +19,11 @@
         "CMAKE_BUILD_TYPE": "Release",
         "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/cmake/toolchains/vcpkg_optional.cmake"
       }
+    },
+    {
+      "name": "windows-msvc",
+      "generator": "Visual Studio 17 2022",
+      "binaryDir": "${sourceDir}/build/windows-msvc"
     }
   ],
 
@@ -26,6 +31,21 @@
     {
       "name": "codex-linux",
       "configurePreset": "codex-linux"
+    },
+    {
+      "name": "windows-msvc",
+      "configurePreset": "windows-msvc",
+      "configuration": "Release"
+    }
+  ],
+
+  "testPresets": [
+    {
+      "name": "codex-linux",
+      "configurePreset": "codex-linux",
+      "output": {
+        "outputOnFailure": true
+      }
     }
   ]
 }

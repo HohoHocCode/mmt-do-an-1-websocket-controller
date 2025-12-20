@@ -1,6 +1,9 @@
 #pragma once
 #include <string>
+
+#ifdef MMT_ENABLE_OPENCV
 #include <opencv2/opencv.hpp>
+#endif
 
 class Camera {
 public:
@@ -20,5 +23,7 @@ public:
                       std::string& out_format); // ví dụ "avi"
 
 private:
+#ifdef MMT_ENABLE_OPENCV
     cv::VideoCapture cap;
+#endif
 };
