@@ -1,7 +1,7 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
+import { createContext, useCallback, useContext, useMemo, useState } from "react";
 import type { PropsWithChildren } from "react";
-import { login as apiLogin, verifyToken } from "./api";
 import type { AuthUser } from "./types";
+import { verifyOrRegisterUser } from "./user_db";
 
 type AuthContextValue = {
   user: AuthUser | null;
@@ -48,29 +48,11 @@ export function AuthProvider({ children }: PropsWithChildren) {
     localStorage.removeItem(LOCKED_REASON_KEY);
   }, []);
 
-  useEffect(() => {
-    const verifyExisting = async () => {
-      if (!token) return;
-      setLoading(true);
-      try {
-        const res = await verifyToken(token);
-        if (!res.ok || !res.user) {
-          setToken(null);
-          setUser(null);
-          localStorage.removeItem(TOKEN_KEY);
-          localStorage.removeItem(USER_KEY);
-        } else {
-          setUser(res.user);
-          localStorage.setItem(USER_KEY, JSON.stringify(res.user));
-        }
-      } catch {
-        // keep token but mark as needing re-login on demand
-      } finally {
-        setLoading(false);
-      }
-    };
-    verifyExisting();
-  }, [token]);
+  // Local (client-side) auth mode:
+  // - We trust the persisted token/user pair if present.
+  // - No server-side verification is performed here.
+  // This keeps the app runnable without requiring /api/auth endpoints.
+  // If you later add a real auth service, you can re-introduce token verification.
 
   const setSession = useCallback((nextToken: string, nextUser: AuthUser) => {
     setToken(nextToken);
@@ -85,11 +67,12 @@ export function AuthProvider({ children }: PropsWithChildren) {
     async (username: string, password: string) => {
       setLoading(true);
       try {
-        const res = await apiLogin({ username, password });
-        if ("status" in res) {
-          throw new Error(res.status);
-        }
-        setSession(res.token, res.user);
+        const result = verifyOrRegisterUser(username, password);
+        if (!result.ok) throw new Error(result.error);
+        const nextUser: AuthUser = { username: username.trim(), role: "admin" };
+        // Dummy token to satisfy app logic that expects a token string.
+        const nextToken = `local-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+        setSession(nextToken, nextUser);
         localStorage.setItem("rdc.lastLoginAt", new Date().toISOString());
         localStorage.removeItem("rdc.lastLogoutAt");
       } finally {

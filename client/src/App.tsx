@@ -30,6 +30,8 @@ import {
   Video,
   Wifi,
   XCircle,
+  LogOut,
+  Terminal,
 } from "lucide-react";
 import LoginPage from "./LoginPage";
 import { useAuth } from "./auth";
@@ -158,6 +160,10 @@ const createRequestId = () => {
   }
   return `req-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 };
+
+function classNames(...parts: Array<string | false | null | undefined>) {
+  return parts.filter(Boolean).join(" ");
+}
 const ACTION_TIMEOUT_MS = 20000;
 const STREAM_ACTION_TIMEOUT_MS = 3500;
 
@@ -172,9 +178,12 @@ function b64ToBlob(b64: string, mime: string): Blob {
   return new Blob([new Uint8Array(byteNumbers)], { type: mime });
 }
 
-function b64ToBytes(b64: string): Uint8Array {
+function b64ToBytes(b64: string): Uint8Array<ArrayBuffer> {
   const byteChars = atob(b64);
-  const bytes = new Uint8Array(byteChars.length);
+  // Use an explicit ArrayBuffer so the resulting Uint8Array is typed as Uint8Array<ArrayBuffer>
+  // (avoids TS BlobPart incompatibility with Uint8Array<ArrayBufferLike> in newer lib dom typings).
+  const buffer = new ArrayBuffer(byteChars.length);
+  const bytes = new Uint8Array(buffer);
   for (let i = 0; i < byteChars.length; i++) {
     bytes[i] = byteChars.charCodeAt(i);
   }
@@ -308,7 +317,7 @@ const isFormElement = (target: EventTarget | null) => {
 };
 
 export default function App() {
-  const { user, token, locked, lockedReason, lockSession } = useAuth();
+  const { user, token, locked, lockedReason, lockSession, logout } = useAuth();
   const [activeView, setActiveView] = useState<"dashboard" | "remote">("dashboard");
   const [targets, setTargets] = useState<RemoteTarget[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
@@ -363,6 +372,32 @@ export default function App() {
     () => targets.find((t) => t.id === activeId) ?? targets[0] ?? null,
     [targets, activeId]
   );
+
+  const handleLogout = useCallback(async () => {
+    try {
+      if (token) {
+        await logAudit(token, "logout", { username: user?.username ?? "unknown" });
+      }
+    } catch {
+      // ignore
+    }
+
+    targets.forEach((t) => {
+      try {
+        t.ws?.close();
+      } catch {
+        // ignore
+      }
+    });
+
+    setTargets([]);
+    setActiveId(null);
+    setSelectedForBroadcast([]);
+    setBroadcastMode(false);
+    setPowerMenuOpen(false);
+    setActiveView("dashboard");
+    logout();
+  }, [logout, token, user?.username, targets]);
 
   useEffect(() => {
     if (!active) return;
@@ -1385,7 +1420,7 @@ export default function App() {
     if (active.files.downloadingPath) return;
     updateFileState(active.id, { downloadingPath: item.path, error: null });
     const startTime = Date.now();
-    const chunks: Uint8Array[] = [];
+    const chunks: BlobPart[] = [];
     let offset = 0;
     let eof = false;
     try {
@@ -1418,9 +1453,7 @@ export default function App() {
         }
       }
 
-      const blob = new Blob(chunks.map((chunk) => chunk.slice().buffer), {
-        type: "application/octet-stream",
-      });
+      const blob = new Blob(chunks, { type: "application/octet-stream" });
       const url = URL.createObjectURL(blob);
       const anchor = document.createElement("a");
       anchor.href = url;
@@ -1585,12 +1618,12 @@ export default function App() {
 
   return (
     <>
-    <div className="min-h-screen bg-[#040A18] text-slate-100 p-4 md:p-6 relative overflow-hidden">
+    <div className="min-h-screen bg-[#040A18] text-slate-100 p-4 md:p-6 relative overflow-x-hidden">
       <div className="pointer-events-none absolute inset-0">
         <div className="absolute -top-56 -left-40 h-[680px] w-[680px] rounded-full bg-blue-600/20 blur-3xl" />
         <div className="absolute -bottom-56 -right-48 h-[720px] w-[720px] rounded-full bg-cyan-500/20 blur-3xl" />
       </div>
-      <div className="max-w-7xl mx-auto flex flex-col gap-4 h-[calc(100vh-2rem)]">
+      <div className="max-w-7xl mx-auto flex flex-col gap-4">
         <Header title="Remote Control Center" connectedCount={targets.filter((t) => t.connected).length} />
 
         <div className="bg-secondary/40 border border-border rounded-2xl px-4 py-3 shadow-lg flex flex-wrap items-center gap-3 justify-between">
@@ -1646,6 +1679,17 @@ export default function App() {
               <Lock className="w-4 h-4" /> Lock session
             </button>
 
+
+            <button
+              onClick={() => {
+                recordAudit("logout", { source: "ui" });
+                handleLogout();
+              }}
+              className="inline-flex items-center gap-2 px-3 py-2 rounded-lg bg-slate-900/60 border border-border text-sm hover:bg-slate-800"
+              title="Sign out"
+            >
+              <LogOut className="w-4 h-4 text-rose-200" /> Logout
+            </button>
             <div className="relative">
               <button
                 onClick={() => {
@@ -2021,39 +2065,61 @@ export default function App() {
                 {/* Actions */}
                 <div className="bg-secondary/50 border border-border rounded-2xl p-4 shadow-lg">
                   {/* Task Menu */}
-                  <div className="flex items-center gap-2 mb-4">
-                    <button
-                      onClick={() => setActiveTask("process")}
-                      className={`px-3 py-1.5 rounded-lg text-xs border transition ${
-                        activeTask === "process"
-                          ? "bg-primary/20 border-primary/40 text-primary"
-                          : "bg-slate-900/60 border-border text-muted-foreground hover:bg-slate-800"
-                      }`}
-                    >
-                      Process
-                    </button>
+                  <div className="flex items-center gap-3 mb-4">
+                    <div className="inline-flex items-center rounded-2xl border border-border bg-slate-950/35 p-1 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.04)]">
+                      <button
+                        onClick={() => setActiveTask("process")}
+                        className={classNames(
+                          "inline-flex items-center gap-2 px-3 py-2 rounded-xl text-xs font-semibold transition",
+                          "focus:outline-none focus:ring-2 focus:ring-primary/50",
+                          activeTask === "process"
+                            ? "bg-gradient-to-br from-blue-500/25 via-blue-500/15 to-cyan-500/15 text-slate-50 border border-blue-400/30 shadow"
+                            : "text-slate-300 hover:bg-slate-800/60"
+                        )}
+                        title="Process operations"
+                      >
+                        <Cpu className="w-4 h-4" />
+                        Process
+                      </button>
 
-                    <button
-                      onClick={() => setActiveTask("stream")}
-                      className={`px-3 py-1.5 rounded-lg text-xs border transition ${
-                        activeTask === "stream"
-                          ? "bg-primary/20 border-primary/40 text-primary"
-                          : "bg-slate-900/60 border-border text-muted-foreground hover:bg-slate-800"
-                      }`}
-                    >
-                      Stream
-                    </button>
+                      <button
+                        onClick={() => setActiveTask("stream")}
+                        className={classNames(
+                          "inline-flex items-center gap-2 px-3 py-2 rounded-xl text-xs font-semibold transition",
+                          "focus:outline-none focus:ring-2 focus:ring-primary/50",
+                          activeTask === "stream"
+                            ? "bg-gradient-to-br from-blue-500/25 via-blue-500/15 to-cyan-500/15 text-slate-50 border border-blue-400/30 shadow"
+                            : "text-slate-300 hover:bg-slate-800/60"
+                        )}
+                        title="Screen / camera capture"
+                      >
+                        <Monitor className="w-4 h-4" />
+                        Stream
+                      </button>
 
-                    <button
-                      onClick={() => setActiveTask("command")}
-                      className={`px-3 py-1.5 rounded-lg text-xs border transition ${
-                        activeTask === "command"
-                          ? "bg-primary/20 border-primary/40 text-primary"
-                          : "bg-slate-900/60 border-border text-muted-foreground hover:bg-slate-800"
-                      }`}
-                    >
-                      Command
-                    </button>
+                      <button
+                        onClick={() => setActiveTask("command")}
+                        className={classNames(
+                          "inline-flex items-center gap-2 px-3 py-2 rounded-xl text-xs font-semibold transition",
+                          "focus:outline-none focus:ring-2 focus:ring-primary/50",
+                          activeTask === "command"
+                            ? "bg-gradient-to-br from-blue-500/25 via-blue-500/15 to-cyan-500/15 text-slate-50 border border-blue-400/30 shadow"
+                            : "text-slate-300 hover:bg-slate-800/60"
+                        )}
+                        title="JSON command console"
+                      >
+                        <Terminal className="w-4 h-4" />
+                        Command
+                      </button>
+                    </div>
+
+                    <div className="hidden sm:flex items-center gap-2 text-[11px] text-muted-foreground">
+                      <span className="inline-flex h-2 w-2 rounded-full bg-primary/70" />
+                      <span className="uppercase tracking-wide">Active</span>
+                      <span className="text-slate-200 font-semibold">
+                        {activeTask === "process" ? "Process" : activeTask === "stream" ? "Stream" : "Command"}
+                      </span>
+                    </div>
                   </div>
 
                   <div className="flex flex-col lg:flex-row gap-4 lg:items-end lg:justify-between">
