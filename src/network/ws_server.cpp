@@ -1,6 +1,7 @@
 #include "network/ws_server.hpp"
 #include "core/dispatcher.hpp"
 #include "utils/json.hpp"
+#include "utils/limits.hpp"
 #include "modules/screen.hpp"
 #include "modules/system_control.hpp"
 
@@ -474,29 +475,29 @@ private:
         buffer_.consume(buffer_.size());
 
         std::cout << "[WsServer] Received: " << req << "\n";
-        static constexpr std::size_t kMaxMessageBytes = 256 * 1024;
-        if (req.size() > kMaxMessageBytes) {
+        if (req.size() > limits::kMaxMessageBytes) {
             Json resp;
             resp["cmd"] = "unknown";
             resp["status"] = "error";
-            resp["message"] = "message_too_large";
+            resp["error"] = "message_too_large";
+            resp["message"] = "Message too large";
             send_text(resp.dump());
             do_read();
             return;
         }
 
-        Json j;
-        try {
-            j = Json::parse(req);
-        } catch (const std::exception& e) {
+        JsonParseResult parsed = parse_json_safe(req);
+        if (!parsed.ok) {
             Json resp;
             resp["cmd"] = "unknown";
             resp["status"] = "error";
-            resp["message"] = std::string("invalid_json: ") + e.what();
+            resp["error"] = parsed.error;
+            resp["message"] = "Invalid JSON";
             send_text(resp.dump());
             do_read();
             return;
         }
+        Json j = std::move(parsed.value);
 
         if (j.contains("type") && j["type"].is_string() && j["type"] == "webrtc") {
             handle_webrtc_message(j);
@@ -545,10 +546,10 @@ private:
             int max_height = j.value("max_height", 0);
 
             StreamConfig config;
-            config.fps = clamp_int(fps, 1, 30);
-            config.jpeg_quality = clamp_int(jpeg_quality, 30, 95);
-            config.max_width = clamp_int(max_width, 0, 7680);
-            config.max_height = clamp_int(max_height, 0, 4320);
+            config.fps = limits::clamp_stream_fps(fps);
+            config.jpeg_quality = limits::clamp_stream_jpeg_quality(jpeg_quality);
+            config.max_width = limits::clamp_stream_max_width(max_width);
+            config.max_height = limits::clamp_stream_max_height(max_height);
 
             if (config.fps != fps) {
                 std::cout << "[WsServer] stream config: fps clamped from " << fps << " to " << config.fps << "\n";
@@ -730,10 +731,6 @@ private:
         }
         mouse_move_count_++;
         return mouse_move_count_ <= 200;
-    }
-
-    static int clamp_int(int value, int min_value, int max_value) {
-        return std::clamp(value, min_value, max_value);
     }
 
     void send_json(const Json& payload) {
@@ -1368,6 +1365,10 @@ struct WsServer::Impl {
             discovery->stop();
         }
     }
+
+    void stop() {
+        ioc.stop();
+    }
 };
 
 WsServer::WsServer() : pimpl_(std::make_unique<Impl>()) {}
@@ -1375,4 +1376,8 @@ WsServer::~WsServer() = default;
 
 void WsServer::run(const std::string& addr, unsigned short port) {
     pimpl_->start(addr, port);
+}
+
+void WsServer::stop() {
+    pimpl_->stop();
 }

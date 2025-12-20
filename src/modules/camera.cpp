@@ -5,6 +5,7 @@
 #include <fstream>
 #include <cstdio>   // std::remove
 
+#ifdef MMT_ENABLE_OPENCV
 Camera::Camera() {}
 
 Camera::~Camera() {
@@ -113,3 +114,27 @@ bool Camera::captureVideo(int durationSeconds,
 
     return true;
 }
+#else
+Camera::Camera() = default;
+Camera::~Camera() = default;
+
+bool Camera::open(int) {
+    return false;
+}
+
+bool Camera::isOpened() const {
+    return false;
+}
+
+void Camera::close() {}
+
+bool Camera::captureFrame(std::string&) {
+    return false;
+}
+
+bool Camera::captureVideo(int,
+                          std::string&,
+                          std::string&) {
+    return false;
+}
+#endif

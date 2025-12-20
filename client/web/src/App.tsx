@@ -1418,7 +1418,9 @@ export default function App() {
         }
       }
 
-      const blob = new Blob(chunks, { type: "application/octet-stream" });
+      const blob = new Blob(chunks.map((chunk) => chunk.slice().buffer), {
+        type: "application/octet-stream",
+      });
       const url = URL.createObjectURL(blob);
       const anchor = document.createElement("a");
       anchor.href = url;

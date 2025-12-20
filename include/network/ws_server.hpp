@@ -9,6 +9,7 @@ public:
     ~WsServer();
 
     void run(const std::string& address, unsigned short port);
+    void stop();
 
 private:
     struct Impl;

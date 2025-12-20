@@ -129,7 +129,7 @@ Json ProcessManager::start_process(const std::string& path)
             return error_response("path_not_found", "Executable path does not exist");
         }
 
-        std::wstring wpath = utf8_to_wide(exe_path.wstring());
+        std::wstring wpath = exe_path.wstring();
 
         STARTUPINFOW si{};
         PROCESS_INFORMATION pi{};

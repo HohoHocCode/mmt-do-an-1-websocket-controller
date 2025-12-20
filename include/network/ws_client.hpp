@@ -28,6 +28,7 @@ public:
 
     void send(const std::string& msg);
     void close();
+    bool is_connected() const;
 
     void set_message_handler(MessageHandler handler);
     void set_error_handler(ErrorHandler handler);
