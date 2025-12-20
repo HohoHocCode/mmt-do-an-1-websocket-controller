@@ -19,6 +19,7 @@
 #include <atomic>
 #include <array>
 #include <cctype>
+#include <algorithm>
 #include <deque>
 #include <functional>
 #include <mutex>
@@ -335,12 +336,14 @@ class WebSocketSession : public std::enable_shared_from_this<WebSocketSession> {
 public:
     WebSocketSession(tcp::socket socket,
                      asio::thread_pool& dispatcher_pool,
+                     asio::thread_pool& stream_pool,
                      std::shared_ptr<RoomManager> room_manager)
         : ws_(std::move(socket))
         , strand_(asio::make_strand(ws_.get_executor()))
         , stream_timer_(strand_)   // timer dùng chung executor với websocket
         , stream_guard_timer_(strand_)
         , dispatcher_pool_(dispatcher_pool)
+        , stream_pool_(stream_pool)
         , auth_api_base_(std::getenv("AUTH_API_URL") ? std::getenv("AUTH_API_URL") : "http://localhost:5179")
         , room_manager_(std::move(room_manager))
     {
@@ -384,6 +387,7 @@ private:
     std::string auth_token_;
     std::string auth_api_base_;
     asio::thread_pool& dispatcher_pool_;
+    asio::thread_pool& stream_pool_;
     std::size_t pending_jobs_ = 0;
     static constexpr std::size_t max_pending_jobs_ = 32;
     std::unordered_set<std::string> inflight_cmds_;
@@ -404,7 +408,30 @@ private:
     int stream_seq_ = 0;
     int stream_interval_ms_ = 0;
     int stream_total_frames_ = 0;
-    std::uint64_t stream_generation_ = 0;
+    std::atomic<std::uint64_t> stream_generation_{0};
+    std::atomic<bool> stream_cancelled_{true};
+    std::atomic<std::size_t> stream_pending_jobs_{0};
+    static constexpr std::size_t max_stream_pending_jobs_ = 3;
+
+    struct StreamConfig {
+        int fps = 5;
+        int jpeg_quality = 80;
+        int max_width = 0;
+        int max_height = 0;
+    };
+
+    struct StreamTelemetry {
+        std::uint64_t frames_sent = 0;
+        std::uint64_t frames_dropped = 0;
+        double total_capture_ms = 0.0;
+        double total_encode_ms = 0.0;
+        std::uint64_t samples = 0;
+        std::size_t last_bytes = 0;
+        std::chrono::steady_clock::time_point last_stats_log = std::chrono::steady_clock::now();
+    };
+
+    StreamConfig stream_config_;
+    StreamTelemetry stream_stats_;
 
 
     // ------------------------------------------------------------------------
@@ -512,15 +539,44 @@ private:
         if (cmd == "screen_stream") {
             int duration = j.value("duration", 5);
             int fps = j.value("fps", 5);
+            int jpeg_quality = j.value("jpeg_quality", 80);
+            int max_width = j.value("max_width", 0);
+            int max_height = j.value("max_height", 0);
+
+            StreamConfig config;
+            config.fps = clamp_int(fps, 1, 30);
+            config.jpeg_quality = clamp_int(jpeg_quality, 30, 95);
+            config.max_width = clamp_int(max_width, 0, 7680);
+            config.max_height = clamp_int(max_height, 0, 4320);
+
+            if (config.fps != fps) {
+                std::cout << "[WsServer] stream config: fps clamped from " << fps << " to " << config.fps << "\n";
+            }
+            if (config.jpeg_quality != jpeg_quality) {
+                std::cout << "[WsServer] stream config: jpeg_quality clamped from " << jpeg_quality
+                          << " to " << config.jpeg_quality << "\n";
+            }
+            if (config.max_width != max_width || config.max_height != max_height) {
+                std::cout << "[WsServer] stream config: max dimensions clamped to "
+                          << config.max_width << "x" << config.max_height << "\n";
+            }
+            if ((config.max_width > 0 || config.max_height > 0) && !ScreenCapture::supports_resize()) {
+                std::cout << "[WsServer] stream config: resize unsupported, streaming full resolution\n";
+                config.max_width = 0;
+                config.max_height = 0;
+            }
 
             Json ack;
             ack["cmd"] = "screen_stream";
-            if (!start_screen_stream(duration, fps)) {
+            if (!start_screen_stream(duration, config)) {
                 ack["status"] = "already_running";
             } else {
                 ack["status"] = "started";
                 ack["duration"] = duration;
-                ack["fps"] = fps;
+                ack["fps"] = config.fps;
+                ack["jpeg_quality"] = config.jpeg_quality;
+                if (config.max_width > 0) ack["max_width"] = config.max_width;
+                if (config.max_height > 0) ack["max_height"] = config.max_height;
             }
             apply_request_id(j, ack);
             send_text(ack.dump());
@@ -675,6 +731,10 @@ private:
         return mouse_move_count_ <= 200;
     }
 
+    static int clamp_int(int value, int min_value, int max_value) {
+        return std::clamp(value, min_value, max_value);
+    }
+
     void send_json(const Json& payload) {
         send_text(payload.dump());
     }
@@ -820,6 +880,18 @@ private:
         );
     }
 
+    bool enqueue_stream_write(std::shared_ptr<std::string> msg) {
+        if (outbox_.size() >= max_stream_backlog_) {
+            return false;
+        }
+        outbox_.push_back(std::move(msg));
+        if (!write_in_progress_) {
+            write_in_progress_ = true;
+            do_write();
+        }
+        return true;
+    }
+
     void do_write() {
         if (outbox_.empty()) {
             write_in_progress_ = false;
@@ -853,35 +925,40 @@ private:
     }
 
     // ------------------------------------------------------------------------
-    bool start_screen_stream(int duration, int fps) {
+    bool start_screen_stream(int duration, const StreamConfig& config) {
         if (streaming_) {
             std::cout << "[WsServer] Screen stream request rejected: already streaming\n";
             return false;
         }
 
-        if (fps < 1) fps = 1;
-        if (fps > 30) fps = 30;
         if (duration < 1) duration = 3;
         if (duration > 60) duration = 60;
 
         streaming_ = true;
         stream_seq_ = 0;
-        stream_interval_ms_ = 1000 / fps;
-        stream_total_frames_ = duration * fps;
-        stream_generation_++;
-        const auto generation = stream_generation_;
+        stream_config_ = config;
+        stream_interval_ms_ = 1000 / stream_config_.fps;
+        stream_total_frames_ = duration * stream_config_.fps;
+        const auto generation = stream_generation_.fetch_add(1) + 1;
+        stream_cancelled_.store(false);
+        stream_stats_ = StreamTelemetry{};
 
         stream_guard_timer_.expires_after(std::chrono::seconds(60));
         stream_guard_timer_.async_wait([self = shared_from_this(), generation](const beast::error_code& ec) {
-            if (!ec && generation == self->stream_generation_) {
+            if (!ec && generation == self->stream_generation_.load()) {
                 self->stop_stream("timeout");
             }
         });
 
         std::cout << "[WsServer] Streaming start: "
-                  << fps << " fps, "
+                  << stream_config_.fps << " fps, "
                   << duration << " sec, total frames = "
-                  << stream_total_frames_ << "\n";
+                  << stream_total_frames_
+                  << ", jpeg_quality=" << stream_config_.jpeg_quality;
+        if (stream_config_.max_width > 0 || stream_config_.max_height > 0) {
+            std::cout << ", max=" << stream_config_.max_width << "x" << stream_config_.max_height;
+        }
+        std::cout << "\n";
 
         stream_timer_.expires_after(std::chrono::milliseconds(stream_interval_ms_));
         stream_timer_.async_wait(
@@ -895,7 +972,8 @@ private:
     // ------------------------------------------------------------------------
     void stop_stream(const std::string& reason) {
         streaming_ = false;
-        stream_generation_++;
+        stream_cancelled_.store(true);
+        stream_generation_.fetch_add(1);
         beast::error_code cancel_ec;
         stream_timer_.cancel(cancel_ec);
         stream_guard_timer_.cancel(cancel_ec);
@@ -905,7 +983,7 @@ private:
     // ------------------------------------------------------------------------
     void do_stream_frame(beast::error_code ec, std::uint64_t generation) {
         if (ec == asio::error::operation_aborted) return;
-        if (!streaming_ || generation != stream_generation_) return;
+        if (!streaming_ || generation != stream_generation_.load() || stream_cancelled_.load()) return;
 
         if (stream_seq_ >= stream_total_frames_) {
             std::cout << "[WsServer] Stream finished\n";
@@ -913,34 +991,113 @@ private:
             return;
         }
 
-        std::string b64 = ScreenCapture::capture_base64();
-        if (b64.empty()) {
-            std::cerr << "[WsServer] ScreenCapture failed\n";
-            stop_stream("capture_failed");
+        maybe_log_stream_stats();
+
+        const auto pending_jobs = stream_pending_jobs_.load();
+        if (pending_jobs >= max_stream_pending_jobs_ || outbox_.size() >= max_stream_backlog_) {
+            stream_stats_.frames_dropped++;
+            std::cout << "[WsServer] stream_drop_frame reason=backpressure pending=" << pending_jobs << "\n";
+            stream_seq_++;
+            schedule_next_stream_tick(generation);
             return;
         }
-        if (!streaming_ || generation != stream_generation_) return;
 
-        Json j;
-        j["cmd"] = "screen_stream";
-        j["seq"] = stream_seq_;
-        j["image_base64"] = b64;
+        stream_pending_jobs_.fetch_add(1);
+        const int seq = stream_seq_;
+        const auto config = stream_config_;
+        auto self = shared_from_this();
+        asio::post(stream_pool_, [self, generation, seq, config]() {
+            if (self->stream_cancelled_.load() || generation != self->stream_generation_.load()) {
+                asio::post(self->strand_, [self, generation]() {
+                    self->complete_stream_job();
+                    if (generation != self->stream_generation_.load()) {
+                        self->stream_stats_.frames_dropped++;
+                    }
+                });
+                return;
+            }
 
-        if (outbox_.size() < max_stream_backlog_) {
-            enqueue_write(std::make_shared<std::string>(j.dump()), true);
-        }
-
-        if (!streaming_ || generation != stream_generation_) return;
+            ScreenCaptureOptions options;
+            options.jpeg_quality = config.jpeg_quality;
+            options.max_width = config.max_width;
+            options.max_height = config.max_height;
+            auto result = ScreenCapture::capture_base64(options);
+            asio::post(self->strand_, [self, generation, seq, result = std::move(result)]() mutable {
+                self->handle_stream_result(generation, seq, std::move(result));
+            });
+        });
 
         stream_seq_++;
-        stream_timer_.expires_after(
-            std::chrono::milliseconds(stream_interval_ms_)
-        );
+        schedule_next_stream_tick(generation);
+    }
+
+    void schedule_next_stream_tick(std::uint64_t generation) {
+        stream_timer_.expires_after(std::chrono::milliseconds(stream_interval_ms_));
         stream_timer_.async_wait(
             [self = shared_from_this(), generation](const beast::error_code& timer_ec) {
                 self->do_stream_frame(timer_ec, generation);
             }
         );
+    }
+
+    void complete_stream_job() {
+        auto pending = stream_pending_jobs_.load();
+        if (pending > 0) {
+            stream_pending_jobs_.fetch_sub(1);
+        }
+    }
+
+    void handle_stream_result(std::uint64_t generation, int seq, ScreenCaptureResult result) {
+        complete_stream_job();
+        if (!streaming_ || generation != stream_generation_.load() || stream_cancelled_.load()) {
+            stream_stats_.frames_dropped++;
+            return;
+        }
+
+        if (result.base64.empty()) {
+            std::cerr << "[WsServer] ScreenCapture failed\n";
+            stop_stream("capture_failed");
+            return;
+        }
+
+        stream_stats_.samples++;
+        stream_stats_.total_capture_ms += result.capture_ms;
+        stream_stats_.total_encode_ms += result.encode_ms;
+        stream_stats_.last_bytes = result.bytes;
+
+        Json j;
+        j["cmd"] = "screen_stream";
+        j["seq"] = seq;
+        j["streamId"] = generation;
+        j["image_base64"] = result.base64;
+        j["width"] = result.width;
+        j["height"] = result.height;
+        if (result.resized) {
+            j["resized"] = true;
+        }
+
+        if (enqueue_stream_write(std::make_shared<std::string>(j.dump()))) {
+            stream_stats_.frames_sent++;
+        } else {
+            stream_stats_.frames_dropped++;
+            std::cout << "[WsServer] stream_drop_frame reason=backpressure pending=" << stream_pending_jobs_.load() << "\n";
+        }
+    }
+
+    void maybe_log_stream_stats() {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - stream_stats_.last_stats_log < std::chrono::seconds(2)) {
+            return;
+        }
+        stream_stats_.last_stats_log = now;
+        const double avg_capture = stream_stats_.samples > 0 ? stream_stats_.total_capture_ms / stream_stats_.samples : 0.0;
+        const double avg_encode = stream_stats_.samples > 0 ? stream_stats_.total_encode_ms / stream_stats_.samples : 0.0;
+        std::cout << "[WsServer] stream_stats sent=" << stream_stats_.frames_sent
+                  << " dropped=" << stream_stats_.frames_dropped
+                  << " avg_capture_ms=" << avg_capture
+                  << " avg_encode_ms=" << avg_encode
+                  << " last_bytes=" << stream_stats_.last_bytes
+                  << "\n";
     }
 };
 
@@ -1126,10 +1283,12 @@ public:
     Listener(asio::io_context& ioc,
              tcp::endpoint endpoint,
              asio::thread_pool& dispatcher_pool,
+             asio::thread_pool& stream_pool,
              std::shared_ptr<RoomManager> room_manager)
         : ioc_(ioc)
         , acceptor_(ioc)
         , dispatcher_pool_(dispatcher_pool)
+        , stream_pool_(stream_pool)
         , room_manager_(std::move(room_manager))
     {
         beast::error_code ec;
@@ -1148,6 +1307,7 @@ private:
     asio::io_context& ioc_;
     tcp::acceptor acceptor_;
     asio::thread_pool& dispatcher_pool_;
+    asio::thread_pool& stream_pool_;
     std::shared_ptr<RoomManager> room_manager_;
 
     void do_accept() {
@@ -1162,7 +1322,7 @@ private:
 
     void on_accept(beast::error_code ec, tcp::socket socket) {
         if (!ec) {
-            std::make_shared<WebSocketSession>(std::move(socket), dispatcher_pool_, room_manager_)->start();
+            std::make_shared<WebSocketSession>(std::move(socket), dispatcher_pool_, stream_pool_, room_manager_)->start();
         }
         do_accept();
     }
@@ -1176,6 +1336,7 @@ struct WsServer::Impl {
     asio::io_context ioc;
     std::unique_ptr<DiscoveryResponder> discovery;
     asio::thread_pool dispatcher_pool{std::max(2u, std::thread::hardware_concurrency())};
+    asio::thread_pool stream_pool{std::max(2u, std::thread::hardware_concurrency())};
     std::shared_ptr<RoomManager> room_manager = std::make_shared<RoomManager>();
 
     void start(const std::string& addr, unsigned short port) {
@@ -1191,11 +1352,12 @@ struct WsServer::Impl {
         }
 
         tcp::endpoint ep(asio::ip::make_address(addr), port);
-        std::make_shared<Listener>(ioc, ep, dispatcher_pool, room_manager)->run();
+        std::make_shared<Listener>(ioc, ep, dispatcher_pool, stream_pool, room_manager)->run();
         std::cout << "[WsServer] Listening on " << addr << ":" << port << "\n";
         ioc.run();
 
         dispatcher_pool.join();
+        stream_pool.join();
         if (discovery) {
             discovery->stop();
         }

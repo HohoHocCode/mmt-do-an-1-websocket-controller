@@ -273,11 +273,12 @@ Json Dispatcher::handle_process_start(const Json& req)
 
 Json Dispatcher::handle_screen(const Json&)
 {
-    std::string b64 = ScreenCapture::capture_base64();
+    ScreenCaptureOptions options;
+    auto result = ScreenCapture::capture_base64(options);
 
     return {
         {"status", "ok"},
-        {"image_base64", b64}
+        {"image_base64", result.base64}
     };
 }
 
